@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Per-station MLP streamflow predictor with sliding-window features.
+
+Trains a feed-forward network on 365-day meteorological windows plus static
+catchment attributes, evaluates temporal hold-out performance, and exports
+prediction plots and spatial error maps.
+"""
 from __future__ import annotations
 
 import pickle
@@ -59,6 +65,15 @@ np.random.seed(SEED)
 
 @dataclass
 class WindowedSample:
+    """Single supervised sample for MLP streamflow forecasting.
+
+    Attributes:
+        features: Flattened dynamic window concatenated with static catchment
+            attributes, shape ``(window_days * n_dynamic + n_static,)``.
+        target: Observed streamflow on the last day of the window (m³/s).
+        end_date: Calendar date corresponding to the target day.
+        station_id: Three-digit gauging-station identifier.
+    """
     features: np.ndarray
     target: float
     end_date: pd.Timestamp
@@ -66,12 +81,31 @@ class WindowedSample:
 
 
 def _iter_station_frames(data: dict) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield DataFrame entries from a pickle station dictionary.
+
+    Args:
+        data: Raw pickle dict that may contain non-DataFrame values.
+
+    Yields:
+        ``(station_id, dataframe)`` pairs for tabular station payloads.
+    """
     for station_id, df in data.items():
         if isinstance(df, pd.DataFrame):
             yield station_id, df
 
 
 def build_samples(df: pd.DataFrame, station_id: str, window_days: int) -> list[WindowedSample]:
+    """Create sliding-window training samples from one station DataFrame.
+
+    Args:
+        df: Daily station data indexed by date with dynamic, static, and
+            ``Streamflow`` columns.
+        station_id: Identifier stored on each returned sample.
+        window_days: Look-back window length in days.
+
+    Returns:
+        List of ``WindowedSample`` objects with NaN-free dynamic/target rows.
+    """
     df = df.sort_index()
     df = df.dropna(subset=[TARGET_COLUMN] + DYNAMIC_COLUMNS)
 
@@ -98,12 +132,31 @@ def build_samples(df: pd.DataFrame, station_id: str, window_days: int) -> list[W
 
 
 def train_test_split_time(samples: list[WindowedSample], test_fraction: float) -> tuple[list[WindowedSample], list[WindowedSample]]:
+    """Split samples chronologically into train and test subsets.
+
+    Args:
+        samples: Unordered list of windowed samples from all stations.
+        test_fraction: Fraction of the latest samples reserved for testing.
+
+    Returns:
+        Tuple ``(train_samples, test_samples)`` sorted by ``end_date``.
+    """
     samples_sorted = sorted(samples, key=lambda s: s.end_date)
     split_idx = int(len(samples_sorted) * (1 - test_fraction))
     return samples_sorted[:split_idx], samples_sorted[split_idx:]
 
 
 def to_loader(samples: list[WindowedSample], batch_size: int, shuffle: bool) -> DataLoader:
+    """Convert windowed samples to a PyTorch ``DataLoader``.
+
+    Args:
+        samples: Feature/target pairs to batch.
+        batch_size: Minibatch size.
+        shuffle: Whether to shuffle samples each epoch.
+
+    Returns:
+        DataLoader yielding ``(features, target)`` tensor batches.
+    """
     x = np.stack([s.features for s in samples]).astype(np.float32)
     y = np.array([s.target for s in samples], dtype=np.float32).reshape(-1, 1)
     dataset = TensorDataset(torch.from_numpy(x), torch.from_numpy(y))
@@ -111,7 +164,14 @@ def to_loader(samples: list[WindowedSample], batch_size: int, shuffle: bool) -> 
 
 
 class MLP(nn.Module):
+    """Three-layer feed-forward network for scalar streamflow regression."""
+
     def __init__(self, input_dim: int) -> None:
+        """Initialize the MLP with the given input feature dimension.
+
+        Args:
+            input_dim: Size of the flattened window-plus-static feature vector.
+        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -122,10 +182,27 @@ class MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict streamflow from input features.
+
+        Args:
+            x: Feature tensor of shape ``(batch, input_dim)``.
+
+        Returns:
+            Predicted streamflow of shape ``(batch, 1)``.
+        """
         return self.net(x)
 
 
 def save_model(model: nn.Module, model_dir: str | Path | None) -> Path | None:
+    """Persist model weights to ``mlp_streamflow.pt`` under ``model_dir``.
+
+    Args:
+        model: Trained PyTorch module whose ``state_dict`` is saved.
+        model_dir: Output directory, or ``None`` to skip saving.
+
+    Returns:
+        Path to the saved checkpoint, or ``None`` if ``model_dir`` is ``None``.
+    """
     if model_dir is None:
         return None
     model_dir = Path(model_dir)
@@ -136,6 +213,16 @@ def save_model(model: nn.Module, model_dir: str | Path | None) -> Path | None:
 
 
 def load_model(model_path: str | Path, input_dim: int, device: torch.device) -> MLP:
+    """Load a saved MLP checkpoint for inference.
+
+    Args:
+        model_path: Path to a ``.pt`` state-dict file.
+        input_dim: Input feature dimension used when the model was trained.
+        device: Target torch device.
+
+    Returns:
+        Model in evaluation mode with restored weights.
+    """
     model = MLP(input_dim).to(device)
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
@@ -144,6 +231,14 @@ def load_model(model_path: str | Path, input_dim: int, device: torch.device) -> 
 
 
 def _group_samples_by_station(samples: list[WindowedSample]) -> dict[str, list[WindowedSample]]:
+    """Group windowed samples by ``station_id``.
+
+    Args:
+        samples: Flat list of samples from one or more stations.
+
+    Returns:
+        Dict mapping station id to its samples.
+    """
     grouped: dict[str, list[WindowedSample]] = {}
     for sample in samples:
         grouped.setdefault(sample.station_id, []).append(sample)
@@ -154,6 +249,16 @@ def build_prediction_frames(
     model: MLP,
     samples: list[WindowedSample],
 ) -> dict[str, pd.DataFrame]:
+    """Run inference and assemble per-station observed-vs-predicted DataFrames.
+
+    Args:
+        model: Trained MLP placed on the desired device.
+        samples: Windowed samples whose features are fed through the model.
+
+    Returns:
+        Dict keyed by station id. Each DataFrame has columns ``date``,
+        ``observed``, and ``predicted``.
+    """
     if not samples:
         return {}
 
@@ -183,6 +288,17 @@ def compute_errors_by_station(
     samples: list[WindowedSample],
     error_metric: str = "NSE",
 ) -> dict[str, float]:
+    """Compute a hydrological error metric independently for each station.
+
+    Args:
+        model: Trained MLP used for batch inference.
+        samples: Evaluation samples grouped internally by station.
+        error_metric: Metric name accepted by ``compute_station_error``
+            (e.g. ``"NSE"``, ``"RMSE"``, ``"KGE"``).
+
+    Returns:
+        Dict mapping station id to the scalar metric value.
+    """
     if not samples:
         return {}
 
@@ -206,6 +322,7 @@ def compute_errors_by_station(
 
 
 def main() -> None:
+    """Train the default MLP, save weights, and generate evaluation visuals."""
     pickle_path = Path(DEFAULT_PICKLE_PATH)
     with pickle_path.open("rb") as handle:
         data = pickle.load(handle)

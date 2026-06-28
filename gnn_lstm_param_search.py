@@ -1,6 +1,35 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""Iterative one-at-a-time hyperparameter search for Temporal GNN-LSTM models.
+
+Orchestrates training runs, evaluation, visualization export, and baseline
+updates across multiple sweep iterations. Each iteration varies one parameter
+at a time from a fixed baseline, writes per-run diagnostics under a visuals
+root directory, and optionally promotes improved settings to the next
+iteration's baseline.
+
+Output directory layout (under ``visuals_root``)::
+
+    iter_<n>/
+        baseline/<run_name>/          # baseline run plots
+        <param_name>/<run_name>/      # one folder per varied parameter value
+        summaries/
+            param_search_summary.csv  # all runs in the iteration
+            best_params.csv             # best value per swept parameter
+            baseline_update.csv         # baseline promotion decision
+            *_boxplot_by_value.png      # cross-value comparison plots
+            all_params_*_boxplot_grid.png
+
+CSV files use semicolon (``;``) separators. ``param_search_summary.csv`` rows
+contain parameter values, ``varied_param`` / ``varied_value``, per-metric
+``mean_*`` and ``var_*`` columns (station-aggregated), return-period peak
+``mean_peak_*_nRMSE`` / ``var_peak_*_nRMSE`` columns, and ``run_name``.
+
+Model checkpoints are stored under ``models_dir/iter_<n>/`` as ``.pt`` files
+named via :func:`build_run_name`.
+"""
+
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,12 +83,39 @@ UNIFIED_BOXPLOT_YMIN = -0.5
 
 @dataclass
 class ParamOption:
+    """A search-space option pairing a raw value with a display label.
+
+    Attributes:
+        value: Parameter value passed to training (e.g. a callable adjacency
+            builder, int, float, bool, or str).
+        label: Human-readable label used in CSV output and run naming; when
+            ``None``, a label is derived from ``value``.
+    """
+
     value: Any
     label: str | None = None
 
 
 @dataclass
 class BaselineUpdateDecision:
+    """Result of evaluating whether to advance the sweep baseline.
+
+    Attributes:
+        should_continue: Whether another iteration should run.
+        strategy: How the baseline changed: ``"combined_best"``,
+            ``"single_param"``, or ``"stop"``.
+        baseline: Updated (or unchanged) parameter dictionary for the next
+            iteration.
+        baseline_result: Evaluation artifacts for the chosen baseline run.
+        baseline_model_path: Filesystem path to the baseline checkpoint.
+        baseline_nse: Mean station NSE of the new baseline.
+        previous_baseline_nse: Mean station NSE before the update attempt.
+        selected_param: Parameter name updated when ``strategy`` is
+            ``"single_param"``; otherwise ``None``.
+        selected_value_label: Display label of the promoted value for
+            ``"single_param"`` updates; otherwise ``None``.
+    """
+
     should_continue: bool
     strategy: str
     baseline: dict[str, Any]
@@ -78,7 +134,7 @@ BASELINE: dict[str, Any] = {
     "batch_size": 16, #32,
     "message_passes": 3,
     "window_days": 1460, #365,
-    "weighted_adj": ParamOption(create_weighted_adj_matrix_all_ er_distances, "river_dist"),
+    "weighted_adj": ParamOption(create_weighted_adj_matrix_all_river_distances, "river_dist"),
     "aggregation": "max", #"sum",
     "train_error_metric": "RMSE",
     "model_type": ParamOption("dual", "dual"),
@@ -131,6 +187,15 @@ SEARCH_SPACE: dict[str, list[Any]] = {
 
 
 def resolve_param_option(option: Any) -> tuple[Any, str]:
+    """Unwrap a search option into its training value and display label.
+
+    Args:
+        option: A :class:`ParamOption` or a bare parameter value.
+
+    Returns:
+        Tuple of ``(value, label)`` where ``value`` is the object used for
+        training and ``label`` is the string shown in summaries and plots.
+    """
     if isinstance(option, ParamOption):
         label = option.label or param_display_label(option.value)
         return option.value, label
@@ -138,12 +203,30 @@ def resolve_param_option(option: Any) -> tuple[Any, str]:
 
 
 def format_param_value(value: Any) -> str:
+    """Format a scalar parameter value for display.
+
+    Args:
+        value: Numeric or other scalar to stringify.
+
+    Returns:
+        Floats use scientific notation when very small or large; other types
+        use ``str(value)``.
+    """
     if isinstance(value, float):
         return f"{value:.0e}" if value < 0.01 or value >= 1 else f"{value:g}"
     return str(value)
 
 
 def param_display_label(value: Any) -> str:
+    """Build a consistent display label for any parameter value.
+
+    Args:
+        value: Parameter value, :class:`ParamOption`, bool, callable adjacency
+            function, or scalar.
+
+    Returns:
+        Label string suitable for CSV columns and plot legends.
+    """
     if isinstance(value, ParamOption):
         return value.label or param_display_label(value.value)
     if isinstance(value, bool):
@@ -155,6 +238,15 @@ def param_display_label(value: Any) -> str:
 
 
 def _abbreviate_word(word: str) -> str:
+    """Abbreviate a single token for compact run names.
+
+    Args:
+        word: Underscore-separated word fragment.
+
+    Returns:
+        First character uppercased plus remaining characters lowercased, or
+        empty string for blank input.
+    """
     word = word.strip()
     if not word:
         return ""
@@ -164,12 +256,29 @@ def _abbreviate_word(word: str) -> str:
 
 
 def abbreviate_identifier(name: str) -> str:
-    """Camel-case token built from the first two letters of each underscore word."""
+    """Build a compact token from an underscore-separated identifier.
+
+    Args:
+        name: Identifier such as ``"hidden_dim"`` or ``"river_dist"``.
+
+    Returns:
+        Concatenation of abbreviated words (e.g. ``"HiDi"`` for
+        ``"hidden_dim"``).
+    """
     parts = name.replace("-", "_").split("_")
     return "".join(_abbreviate_word(part) for part in parts if part)
 
 
 def abbreviate_param_value(value: Any) -> str:
+    """Abbreviate a parameter value for use in run name segments.
+
+    Args:
+        value: Parameter value or :class:`ParamOption`.
+
+    Returns:
+        Short token: ``"T"``/``"F"`` for bools, numeric strings unchanged,
+        otherwise an abbreviated identifier derived from the display label.
+    """
     if isinstance(value, bool):
         return "T" if value else "F"
     if isinstance(value, ParamOption):
@@ -188,34 +297,93 @@ def abbreviate_param_value(value: Any) -> str:
 
 
 def abbreviate_param_segment(param_name: str, value: Any) -> str:
+    """Combine abbreviated parameter name and value into one run-name segment.
+
+    Args:
+        param_name: Hyperparameter key (e.g. ``"lr"``).
+        value: Parameter value to abbreviate.
+
+    Returns:
+        String like ``"Lr1e-3"`` or ``"Hi64"``.
+    """
     return f"{abbreviate_identifier(param_name)}{abbreviate_param_value(value)}"
 
 
 def resolve_bool_param(value: Any) -> bool:
+    """Coerce a parameter value to bool, unwrapping :class:`ParamOption`.
+
+    Args:
+        value: Boolean or wrapped boolean option.
+
+    Returns:
+        ``bool(value)`` after unwrapping.
+    """
     if isinstance(value, ParamOption):
         return bool(value.value)
     return bool(value)
 
 
 def resolve_model_type_param(value: Any) -> str:
+    """Resolve model type to a string, unwrapping :class:`ParamOption`.
+
+    Args:
+        value: Model type string or wrapped option (e.g. ``"dual"``, ``"mono"``).
+
+    Returns:
+        Model type name as ``str``.
+    """
     if isinstance(value, ParamOption):
         return str(value.value)
     return str(value)
 
 
 def params_have_several_gnn_layers(params: dict[str, Any]) -> bool:
+    """Check whether the configuration uses multiple GNN layers.
+
+    Args:
+        params: Hyperparameter dictionary.
+
+    Returns:
+        ``True`` when ``several_gnn_layers`` is enabled.
+    """
     return resolve_bool_param(params.get("several_gnn_layers", False))
 
 
 def serialize_param_for_csv(value: Any) -> Any:
+    """Serialize a parameter value for CSV export.
+
+    Args:
+        value: Parameter value to record.
+
+    Returns:
+        Display label string (via :func:`param_display_label`).
+    """
     return param_display_label(value)
 
 
 def build_param_labels(params: dict[str, Any]) -> dict[str, str]:
+    """Map each parameter key to its display label.
+
+    Args:
+        params: Hyperparameter dictionary.
+
+    Returns:
+        Dictionary with the same keys and string labels as values.
+    """
     return {key: param_display_label(value) for key, value in params.items()}
 
 
 def build_run_name(baseline_name: str, params: dict[str, Any]) -> str:
+    """Build a unique, filesystem-safe run identifier from hyperparameters.
+
+    Args:
+        baseline_name: Prefix name for the model family (e.g. ``"GNN_lstm"``).
+        params: Full hyperparameter dictionary for the run.
+
+    Returns:
+        Underscore-separated abbreviated name used for checkpoints and output
+        folders. Omits ``weighted_adj`` when ``several_gnn_layers`` is True.
+    """
     ordered_keys = [
         "epochs",
         "hidden_dim",
@@ -248,6 +416,19 @@ def build_train_config(
     models_dir: str | Path,
     examine_train_test_peaks: bool,
 ) -> TrainConfig:
+    """Construct a :class:`TrainConfig` from a hyperparameter dictionary.
+
+    Args:
+        params: Hyperparameter dictionary (keys match ``SEARCH_PARAMS``).
+        run_name: Identifier passed to the trainer for logging and paths.
+        models_dir: Directory where model checkpoints are saved.
+        examine_train_test_peaks: Whether return-period peak metrics include
+            the training period.
+
+    Returns:
+        Config object consumed by :func:`run_temporal_gnn_training` and
+        :func:`load_and_evaluate_temporal_gnn_run`.
+    """
     several_gnn_layers = params_have_several_gnn_layers(params)
     weighted_adj_value = None
     if not several_gnn_layers:
@@ -274,24 +455,70 @@ def build_train_config(
 
 
 def _finite_values(values: dict[str, float]) -> list[float]:
+    """Extract finite numeric values from a per-station metric dictionary.
+
+    Args:
+        values: Mapping of station id to metric value (may contain ``None``
+            or non-finite entries).
+
+    Returns:
+        List of finite floats; empty when no valid values exist.
+    """
     return [float(value) for value in values.values() if value is not None and np.isfinite(value)]
 
 
 def mean_nse_from_result(result: RunResult) -> float:
+    """Compute mean station NSE from a training/evaluation result.
+
+    Args:
+        result: Completed run with ``errors_by_metric["NSE"]`` per station.
+
+    Returns:
+        Mean NSE across stations with finite values, or ``nan`` if none.
+    """
     values = _finite_values(result.errors_by_metric.get("NSE", {}))
     return float(np.mean(values)) if values else float("nan")
 
 
 def mean_nse_from_row(row: dict[str, Any]) -> float:
+    """Read mean NSE from a summary CSV row dictionary.
+
+    Args:
+        row: Row dict produced by :func:`summarize_run_row` (expects
+            ``"mean_NSE"`` key).
+
+    Returns:
+        Finite ``mean_NSE`` value, or ``nan`` if missing or non-finite.
+    """
     value = row.get("mean_NSE", float("nan"))
     return float(value) if value is not None and np.isfinite(value) else float("nan")
 
 
 def param_option_matches(baseline: dict[str, Any], param_name: str, option: Any) -> bool:
+    """Check whether a search option equals the baseline value for one param.
+
+    Args:
+        baseline: Current baseline hyperparameters.
+        param_name: Key to compare.
+        option: Candidate value from ``SEARCH_SPACE``.
+
+    Returns:
+        ``True`` when display labels match for ``baseline[param_name]`` and
+        ``option``.
+    """
     return param_display_label(baseline[param_name]) == param_display_label(option)
 
 
 def baseline_signature(baseline: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Build a hashable signature for comparing parameter sets.
+
+    Args:
+        baseline: Hyperparameter dictionary.
+
+    Returns:
+        Tuple of ``(param_name, label_or_value)`` pairs for keys in
+        ``SEARCH_PARAMS`` present in ``baseline``, ordered consistently.
+    """
     signature: list[tuple[str, Any]] = []
     for key in SEARCH_PARAMS:
         if key not in baseline:
@@ -302,10 +529,32 @@ def baseline_signature(baseline: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
 
 
 def params_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Test whether two hyperparameter dictionaries are equivalent.
+
+    Args:
+        left: First parameter set.
+        right: Second parameter set.
+
+    Returns:
+        ``True`` when :func:`baseline_signature` matches for both.
+    """
     return baseline_signature(left) == baseline_signature(right)
 
 
 def resolve_param_from_label(param_name: str, value_label: str) -> Any:
+    """Look up a search-space option by its display label.
+
+    Args:
+        param_name: Hyperparameter key in ``SEARCH_SPACE``.
+        value_label: Display label to match (as stored in summary CSVs).
+
+    Returns:
+        The matching option from ``SEARCH_SPACE[param_name]`` (may be a
+        :class:`ParamOption` or bare value).
+
+    Raises:
+        ValueError: If no option in the search space has the given label.
+    """
     for option in SEARCH_SPACE[param_name]:
         _, label = resolve_param_option(option)
         if label == value_label:
@@ -322,6 +571,22 @@ def summarize_run_row(
     errors_by_metric: dict[str, dict[str, float]],
     return_period_values: dict[float, dict[str, float]],
 ) -> dict[str, Any]:
+    """Build one summary row for ``param_search_summary.csv``.
+
+    Args:
+        run_name: Unique run identifier from :func:`build_run_name`.
+        varied_param: Parameter varied in this run, or ``"baseline"``.
+        varied_value_label: Display label of the varied value.
+        params: Full hyperparameter dictionary for the run.
+        errors_by_metric: Per-metric station scores (e.g. ``{"NSE": {id: val}}``).
+        return_period_values: Return-period peak nRMSE by period and station;
+            keys are return periods (float), values are station-id dicts.
+
+    Returns:
+        Flat dict with serialized params, ``varied_param``, ``varied_value``,
+        ``mean_*`` / ``var_*`` for each entry in ``ERROR_METRICS``, peak
+        nRMSE aggregates for ``DEFAULT_RETURN_PERIODS``, and ``run_name``.
+    """
     row: dict[str, Any] = {
         "varied_param": varied_param,
         "varied_value": varied_value_label,
@@ -354,6 +619,24 @@ def write_run_visuals(
     comparison_metric: str,
     examine_train_test_peaks: bool,
 ) -> None:
+    """Export diagnostic plots and maps for a single training run.
+
+    Writes under ``visuals_root / varied_param / run_name /``:
+
+    * Test-year hydrograph PNGs (``*_test_years/``)
+    * Return-period nRMSE boxplots and line plots
+    * Graph error map (HTML + PNG) for ``comparison_metric``
+    * KGE-separated map and Conchi NSE comparison map
+
+    Args:
+        result: Evaluated run containing predictions, adjacency, and metrics.
+        run_name: Folder and filename prefix for outputs.
+        visuals_root: Iteration-level visuals directory (e.g. ``iter_1``).
+        varied_param: Subfolder name grouping runs by swept parameter.
+        comparison_metric: Metric used for the graph error map (e.g. ``"NSE"``).
+        examine_train_test_peaks: If True, peak metrics span train+test;
+            otherwise peaks are test-only.
+    """
     run_dir = visuals_root / varied_param / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +724,16 @@ def write_summary_csv(
     run_rows: list[dict[str, Any]],
     output_path: str | Path,
 ) -> Path:
+    """Write iteration summary rows to a semicolon-separated CSV.
+
+    Args:
+        run_rows: List of dicts from :func:`summarize_run_row`.
+        output_path: Destination ``.csv`` path (parent dirs are created).
+
+    Returns:
+        Resolved output path. Columns match keys in ``run_rows``; ``run_name``
+        is placed last when present.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     runs_df = pd.DataFrame(run_rows)
@@ -457,6 +750,19 @@ def write_best_params_csv(
     baseline: dict[str, Any],
     output_path: str | Path,
 ) -> Path:
+    """Write per-parameter best values ranked by mean NSE.
+
+    Args:
+        run_rows: Iteration summary rows (must include ``varied_param``,
+            ``varied_value``, and ``mean_NSE``).
+        search_params: Parameter names to evaluate.
+        baseline: Current baseline for the ``baseline_value`` column.
+        output_path: Destination ``best_params.csv`` path.
+
+    Returns:
+        Resolved output path. CSV columns: ``param_name``, ``baseline_value``,
+        ``new_value`` (display label of the best run for that parameter).
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     best_rows: list[dict[str, str]] = []
@@ -486,6 +792,17 @@ def write_baseline_update_csv(
     decision: BaselineUpdateDecision,
     output_path: str | Path,
 ) -> Path:
+    """Record baseline promotion outcome for one iteration.
+
+    Args:
+        decision: Result from :func:`update_baseline_after_iteration`.
+        output_path: Destination ``baseline_update.csv`` path.
+
+    Returns:
+        Resolved output path. Single-row CSV with strategy, NSE deltas,
+        selected parameter (if any), serialized baseline params, and
+        ``run_name``.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     row = {
@@ -515,6 +832,21 @@ def train_or_load_run(
     trained_runs: dict[str, tuple[RunResult, Path]],
     description: str,
 ) -> tuple[RunResult, Path]:
+    """Train a model or load an existing checkpoint for one parameter set.
+
+    Args:
+        params: Hyperparameters for the run.
+        run_name: Checkpoint basename and cache key.
+        iter_models_dir: Iteration-specific models directory.
+        examine_train_test_peaks: Passed through to :func:`build_train_config`.
+        skip_existing: When True, load from disk if ``.pt`` exists instead of
+            retraining.
+        trained_runs: In-memory cache updated with ``(result, path)`` on success.
+        description: Log prefix describing the run context.
+
+    Returns:
+        Tuple of evaluation :class:`RunResult` and checkpoint :class:`Path`.
+    """
     if run_name in trained_runs:
         print(f"Reusing cached run {run_name} ({description})")
         return trained_runs[run_name]
@@ -550,6 +882,20 @@ def build_combined_params_from_best(
     search_params: list[str],
     baseline: dict[str, Any],
 ) -> dict[str, Any]:
+    """Merge the best per-parameter values into one hyperparameter set.
+
+    For each parameter in ``search_params``, selects the varied value with
+    highest ``mean_NSE`` among iteration rows; unchanged keys keep baseline
+    values when no valid run exists.
+
+    Args:
+        run_rows: Iteration summary rows.
+        search_params: Parameters to optimize independently.
+        baseline: Starting configuration copied before updates.
+
+    Returns:
+        New parameter dictionary with winning options from ``SEARCH_SPACE``.
+    """
     combined = dict(baseline)
     for param_name in search_params:
         param_runs = [
@@ -569,6 +915,18 @@ def find_best_single_param_improvement(
     baseline: dict[str, Any],
     baseline_nse: float,
 ) -> tuple[str, str, dict[str, Any], float] | None:
+    """Find the single-parameter change with the largest NSE gain over baseline.
+
+    Args:
+        run_rows: Iteration summary rows (excludes ``baseline`` and
+            ``combined_best`` pseudo-runs).
+        baseline: Current baseline hyperparameters.
+        baseline_nse: Mean NSE of the current baseline.
+
+    Returns:
+        ``(param_name, value_label, best_row, new_nse)`` when a strictly
+        better single-param run exists; otherwise ``None``.
+    """
     best_row: dict[str, Any] | None = None
     best_delta = 0.0
 
@@ -610,6 +968,28 @@ def update_baseline_after_iteration(
     trained_runs: dict[str, tuple[RunResult, Path]],
     iteration: int,
 ) -> BaselineUpdateDecision:
+    """Decide how to update the baseline after one sweep iteration.
+
+    Tries combined-best params first (train if changed); if mean NSE improves,
+    promotes that set. Otherwise tries the best single-parameter improvement.
+    Stops the sweep when neither strategy beats the current baseline.
+
+    Args:
+        baseline: Hyperparameters at the start of the iteration.
+        baseline_result: Evaluation result for the iteration baseline run.
+        baseline_model_path: Checkpoint path for the baseline model.
+        iteration_rows: Summary rows from :func:`run_one_iteration`.
+        search_params: Parameters included in the sweep.
+        iter_models_dir: Directory for iteration model checkpoints.
+        examine_train_test_peaks: Peak evaluation mode for any new training.
+        skip_existing: Whether to reuse existing checkpoints.
+        trained_runs: Cache of already-trained runs in this iteration.
+        iteration: Current iteration index (for logging).
+
+    Returns:
+        :class:`BaselineUpdateDecision` describing the next baseline and
+        whether to continue.
+    """
     previous_baseline_nse = mean_nse_from_result(baseline_result)
     combined_params = build_combined_params_from_best(iteration_rows, search_params, baseline)
     combined_run_name = build_run_name(BASELINE_NAME, combined_params)
@@ -716,6 +1096,34 @@ def run_one_iteration(
     baseline_model_path: Path | None = None,
     highlight_baseline_in_boxplots: bool = DEFAULT_HIGHLIGHT_BASELINE_IN_BOXPLOTS,
 ) -> tuple[list[dict[str, Any]], RunResult, Path, dict[str, tuple[RunResult, Path]]]:
+    """Execute one full one-at-a-time parameter sweep iteration.
+
+    Trains or loads the baseline, then varies each search parameter across
+    ``SEARCH_SPACE``, writes per-run visuals, aggregates comparison boxplots,
+    and emits ``param_search_summary.csv`` and ``best_params.csv`` under
+    ``visuals_root/iter_<iteration>/summaries/``.
+
+    Args:
+        iteration: 1-based iteration number (used in paths and logs).
+        baseline: Starting hyperparameters for this iteration.
+        search_params: Subset of keys to vary one-at-a-time.
+        models_dir: Root directory for saved checkpoints.
+        visuals_root: Root directory for plots and summary CSVs.
+        comparison_metric: Metric for cross-value boxplots and error maps.
+        examine_train_test_peaks: Peak evaluation spans train+test when True.
+        skip_existing: Reuse checkpoints when present on disk.
+        baseline_result: Optional pre-evaluated baseline to skip retraining.
+        baseline_model_path: Checkpoint path paired with ``baseline_result``.
+        highlight_baseline_in_boxplots: Highlight baseline in comparison plots.
+
+    Returns:
+        Tuple of ``(run_rows, baseline_result, baseline_model_path,
+        trained_runs)`` where ``run_rows`` are summary dicts and
+        ``trained_runs`` maps ``run_name`` to ``(RunResult, Path)``.
+
+    Raises:
+        ValueError: If a name in ``search_params`` is not in ``SEARCH_SPACE``.
+    """
     iter_dir = visuals_root / f"iter_{iteration}"
     iter_models_dir = models_dir / f"iter_{iteration}"
     summaries_dir = iter_dir / "summaries"
@@ -899,6 +1307,28 @@ def run_parameter_sweep(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     highlight_baseline_in_boxplots: bool = DEFAULT_HIGHLIGHT_BASELINE_IN_BOXPLOTS,
 ) -> pd.DataFrame:
+    """Run the full iterative hyperparameter search until convergence or cap.
+
+    Repeatedly calls :func:`run_one_iteration` and
+    :func:`update_baseline_after_iteration`, writing per-iteration artifacts
+    under ``visuals_root/iter_<n>/`` and checkpoints under
+    ``models_dir/iter_<n>/``.
+
+    Args:
+        search_params: Parameters to sweep; defaults to ``SEARCH_PARAMS``.
+        models_dir: Root directory for ``.pt`` checkpoints.
+        visuals_root: Root for iteration folders and summary CSVs.
+        comparison_metric: Metric for boxplots and error maps.
+        examine_train_test_peaks: Include training period in peak metrics.
+        skip_existing: Load existing checkpoints instead of retraining.
+        max_iterations: Upper bound on iterative baseline-update rounds.
+        highlight_baseline_in_boxplots: Highlight baseline in comparison plots.
+
+    Returns:
+        :class:`pandas.DataFrame` read from the latest
+        ``param_search_summary.csv`` when available; otherwise a DataFrame
+        built from all accumulated run rows (semicolon-separated columns).
+    """
     models_dir = Path(models_dir)
     visuals_root = Path(visuals_root)
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -962,6 +1392,13 @@ def run_parameter_sweep(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the parameter search CLI.
+
+    Returns:
+        Parsed namespace with ``params``, ``models_dir``, ``visuals_dir``,
+        ``comparison_metric``, ``max_iterations``, ``test_only_peaks``,
+        ``skip_existing``, and ``no_highlight_baseline`` attributes.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Iterative one-at-a-time hyperparameter sweep for TemporalGNN (GNN-LSTM). "
@@ -1014,6 +1451,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Entry point: parse CLI args and run :func:`run_parameter_sweep`."""
     args = _parse_args()
     run_parameter_sweep(
         search_params=args.params,

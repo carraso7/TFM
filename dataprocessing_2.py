@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Basin summary graphics and station metadata from multi-station pickle data.
+
+Loads daily time series from a pickle file, reports date coverage and train/test
+splits, and generates mean annual cycle plots, multi-variable grids, and CSV
+summaries for GNN-LSTM modelling.
+"""
 from __future__ import annotations
 
 import argparse
@@ -25,8 +31,8 @@ SAME_Y_AXIS = False
 NORMALIZE = True
 SHOW_GRID = False
 INCLUDE_ATMOSPHERIC_INDEXES = False
-FONT_SIZE = 15
-MEAN_CYCLE_FONT_SIZE = FONT_SIZE + 2
+FONT_SIZE = 19
+MEAN_CYCLE_FONT_SIZE = FONT_SIZE # FONT_SIZE + 2
 PUT_ONLY_FIRST_Y_TICKS = True
 DEFAULT_STATION_SUMMARY_DECIMALS = 2
 
@@ -107,6 +113,20 @@ GNN_LSTM_VARIABLE_ROWS = [
 
 @dataclass(frozen=True)
 class VariablePlotSpec:
+    """Plot configuration for one basin-summary variable.
+
+    Attributes:
+        key: Short identifier used in filenames and normalization flags.
+        label: Human-readable variable name for plot titles.
+        y_label: Axis label in physical units.
+        unit: Unit string appended to mean-value subtitles.
+        column_candidates: DataFrame column name(s) resolved via ``resolve_column_name``.
+        clamp_below_zero: If True, clip negative values when computing day-of-year stats.
+        line_color: Matplotlib colour for the mean line.
+        fill_color: Matplotlib colour for the ±1 std band.
+        is_temperature: If True, use dual tmax/tmin plotting instead of a single cycle.
+    """
+
     key: str
     label: str
     y_label: str
@@ -184,6 +204,14 @@ ATMOSPHERIC_INDEX_SPECS: tuple[VariablePlotSpec, ...] = (
 
 
 def build_plot_specs(*, include_atmospheric_indexes: bool = INCLUDE_ATMOSPHERIC_INDEXES) -> tuple[VariablePlotSpec, ...]:
+    """Return the ordered tuple of variable plot specs for basin summary output.
+
+    Args:
+        include_atmospheric_indexes: If True, append SPEI, NAO, and WEMO specs.
+
+    Returns:
+        Tuple of ``VariablePlotSpec`` instances in grid/plot row order.
+    """
     specs: list[VariablePlotSpec] = list(SINGLE_VARIABLE_SPECS) + [TEMPERATURE_SPEC]
     if include_atmospheric_indexes:
         specs.extend(ATMOSPHERIC_INDEX_SPECS)
@@ -191,12 +219,36 @@ def build_plot_specs(*, include_atmospheric_indexes: bool = INCLUDE_ATMOSPHERIC_
 
 
 def _iter_station_frames(data: dict) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield ``(station_id, DataFrame)`` pairs from a pickle root dict.
+
+    Args:
+        data: Mapping loaded from the station pickle; values must be DataFrames.
+
+    Yields:
+        Station ID string and corresponding daily time-series DataFrame.
+    """
     for station_id, frame in data.items():
         if isinstance(frame, pd.DataFrame):
             yield str(station_id), frame
 
 
 def load_pickle_stations(pickle_path: str | Path) -> dict[str, pd.DataFrame]:
+    """Load and align multi-station daily data from a pickle file.
+
+    The pickle must contain ``dict[str, pd.DataFrame]`` where each DataFrame is
+    indexed by date and holds dynamic variables (precipitation, temperature,
+    humidity, streamflow, etc.) plus static catchment columns.
+
+    Args:
+        pickle_path: Path to the input ``.pkl`` file.
+
+    Returns:
+        Mapping ``station_id -> aligned DataFrame`` with a datetime index.
+
+    Raises:
+        TypeError: If the pickle root is not a dict.
+        ValueError: If no station DataFrames are found.
+    """
     pickle_path = Path(pickle_path)
     with pickle_path.open("rb") as handle:
         data = pickle.load(handle)
@@ -209,6 +261,17 @@ def load_pickle_stations(pickle_path: str | Path) -> dict[str, pd.DataFrame]:
 
 
 def load_static_info(static_info_path: str | Path) -> pd.DataFrame:
+    """Load station metadata CSV indexed by ``station_id``.
+
+    Expected columns include ``station_id``, ``Latitude``, ``Longitude``, and
+    other static attributes referenced in station summary output.
+
+    Args:
+        static_info_path: Path to the static-info CSV file.
+
+    Returns:
+        DataFrame indexed by ``station_id`` (string dtype).
+    """
     static_info_df = pd.read_csv(static_info_path, dtype={"station_id": str})
     if "station_id" not in static_info_df.columns:
         static_info_df = static_info_df.reset_index()
@@ -216,6 +279,18 @@ def load_static_info(static_info_path: str | Path) -> pd.DataFrame:
 
 
 def resolve_column_name(df: pd.DataFrame, candidates: tuple[str, ...]) -> str:
+    """Resolve the first matching column name from candidates and aliases.
+
+    Args:
+        df: Station DataFrame whose columns may use short or long names.
+        candidates: Preferred column keys; each may map to aliases in ``COLUMN_ALIASES``.
+
+    Returns:
+        The first alias found in ``df.columns``.
+
+    Raises:
+        ValueError: If none of the candidates (or their aliases) exist.
+    """
     for candidate in candidates:
         aliases = COLUMN_ALIASES.get(candidate, [candidate])
         for alias in aliases:
@@ -225,10 +300,29 @@ def resolve_column_name(df: pd.DataFrame, candidates: tuple[str, ...]) -> str:
 
 
 def resolve_streamflow_column(df: pd.DataFrame) -> str:
+    """Return the streamflow column name for a station DataFrame.
+
+    Args:
+        df: Station DataFrame containing a streamflow/discharge column.
+
+    Returns:
+        Column name string accepted by ``data_processing._streamflow_column``.
+    """
     return _streamflow_column(df)
 
 
 def common_date_index(frames: dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
+    """Compute the intersection of daily dates shared by all stations.
+
+    Args:
+        frames: Mapping ``station_id -> DataFrame`` with datetime indices.
+
+    Returns:
+        Sorted ``DatetimeIndex`` of dates present in every station frame.
+
+    Raises:
+        ValueError: If no common dates exist across stations.
+    """
     common_index: pd.DatetimeIndex | None = None
     for df in frames.values():
         station_index = pd.DatetimeIndex(df.index)
@@ -239,17 +333,58 @@ def common_date_index(frames: dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
 
 
 def format_station_id(station_id: str) -> str:
+    """Normalise a station ID to ``A###`` format with zero-padded digits.
+
+    Args:
+        station_id: Raw station identifier (with or without leading ``A``).
+
+    Returns:
+        Uppercase ID string like ``A001``.
+    """
     normalized = str(station_id).strip().upper()
     if normalized.startswith("A"):
         normalized = normalized[1:]
     return f"A{normalized.zfill(3)}"
 
 
+def _break_title_line_after_in(text: str) -> str:
+    """Insert a line break after the first `` in `` marker in plot titles.
+
+    Args:
+        text: Title text, typically a station label.
+
+    Returns:
+        Text unchanged if no break is needed, otherwise a two-line title.
+    """
+    text = text.replace(" en ", " in ")
+    marker = " in "
+    if marker not in text or " in\n" in text:
+        return text
+    prefix, suffix = text.split(marker, 1)
+    return f"{prefix}{marker}\n{suffix.strip()}"
+
+
 def _format_station_display_name(full_name: str) -> str:
+    """Replace Spanish `` en `` with `` in `` in a station display name.
+
+    Args:
+        full_name: Full station name from the static-info map.
+
+    Returns:
+        Trimmed display name with English preposition.
+    """
     return full_name.strip().replace(" en ", " in ")
 
 
 def _short_station_name(full_name: str) -> str:
+    """Extract the locality portion after `` en `` in a station name.
+
+    Args:
+        full_name: Full station name (e.g. ``Río X en Localidad``).
+
+    Returns:
+        Substring after `` en ``, or the full trimmed name if absent.
+    """
     marker = " en "
     if marker in full_name:
         return full_name.split(marker, 1)[1].strip()
@@ -257,6 +392,15 @@ def _short_station_name(full_name: str) -> str:
 
 
 def format_station_label(station_id: str, station_names: dict[str, str] | None) -> str:
+    """Build a plot label combining formatted ID and optional full name.
+
+    Args:
+        station_id: Raw station identifier.
+        station_names: Optional ``station_id -> full name`` mapping from static info.
+
+    Returns:
+        Label like ``A001: River in Town`` or just ``A001`` when names are missing.
+    """
     station_code = format_station_id(station_id)
     if not station_names:
         return station_code
@@ -267,16 +411,39 @@ def format_station_label(station_id: str, station_names: dict[str, str] | None) 
 
 
 def _mean_cycle_station_label(station_label: str) -> str:
-    return station_label.replace(" en ", " in ")
+    """Format a station label for mean-cycle grid column headers.
+
+    Args:
+        station_label: Label from ``format_station_label``.
+
+    Returns:
+        Title string with a line break after `` in `` when applicable.
+    """
+    return _break_title_line_after_in(station_label)
 
 
 def _mean_cycle_y_label(spec: VariablePlotSpec, *, normalized: bool) -> str:
+    """Return the y-axis label for a mean-cycle or grid row.
+
+    Args:
+        spec: Variable plot specification.
+        normalized: If True, use z-score wording instead of physical units.
+
+    Returns:
+        Axis label string for the given variable and scale.
+    """
     if spec.key == "streamflow" and not normalized:
         return "Mean streamflow"
     return _variable_y_label(spec, normalized=normalized)
 
 
 def _apply_axis_font_size(axis: plt.Axes, font_size: float) -> None:
+    """Set font size on axis labels, tick labels, and title.
+
+    Args:
+        axis: Matplotlib axes to style.
+        font_size: Point size applied to labels, ticks, and title.
+    """
     axis.xaxis.label.set_size(font_size)
     axis.yaxis.label.set_size(font_size)
     axis.tick_params(labelsize=font_size)
@@ -286,6 +453,14 @@ def _apply_axis_font_size(axis: plt.Axes, font_size: float) -> None:
 
 
 def _plot_font_rc_context(font_size: float):
+    """Return a matplotlib ``rc_context`` with uniform plot font sizes.
+
+    Args:
+        font_size: Base font size for axes, ticks, legend, and titles.
+
+    Returns:
+        Context manager from ``plt.rc_context``.
+    """
     return plt.rc_context(
         {
             "font.size": font_size,
@@ -299,6 +474,16 @@ def _plot_font_rc_context(font_size: float):
 
 
 def format_mean_subtitle(mean_value: float, unit: str, *, streamflow: bool = False) -> str:
+    """Format the mean-value subtitle shown beneath plot titles.
+
+    Args:
+        mean_value: Series mean over the common date range.
+        unit: Physical unit string for display.
+        streamflow: If True, use ``Mean flow`` wording instead of ``Mean``.
+
+    Returns:
+        Subtitle like ``Mean flow: 12.34 [m³/s]`` or ``Mean: N/A [mm]``.
+    """
     if streamflow:
         if not np.isfinite(mean_value):
             return f"Mean flow: N/A [{unit}]"
@@ -309,6 +494,15 @@ def format_mean_subtitle(mean_value: float, unit: str, *, streamflow: bool = Fal
 
 
 def decimal_to_dms(value: float, *, is_latitude: bool) -> str:
+    """Convert a decimal degree coordinate to degrees-minutes-seconds notation.
+
+    Args:
+        value: Latitude or longitude in decimal degrees.
+        is_latitude: If True, use N/S hemispheres; otherwise E/W.
+
+    Returns:
+        DMS string like ``42°30'15.0"N``, or empty string when ``value`` is non-finite.
+    """
     if not np.isfinite(value):
         return ""
     hemisphere = "N" if is_latitude else "E"
@@ -323,6 +517,15 @@ def decimal_to_dms(value: float, *, is_latitude: bool) -> str:
 
 
 def summarize_station_date_ranges(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Summarise per-station start, end, and length of daily records.
+
+    Args:
+        frames: Mapping ``station_id -> DataFrame`` with datetime index.
+
+    Returns:
+        DataFrame with columns ``station_id``, ``start_date``, ``end_date``,
+        and ``num_days`` (one row per non-empty station).
+    """
     rows: list[dict[str, str | int]] = []
     for station_id, df in sorted(frames.items()):
         if df.empty:
@@ -342,6 +545,20 @@ def compute_train_test_ranges(
     common_index: pd.DatetimeIndex,
     train_fraction: float = DEFAULT_TRAIN_FRACTION,
 ) -> dict[str, pd.Timestamp | int | float]:
+    """Split a common timeline chronologically into train and test day ranges.
+
+    Args:
+        common_index: Sorted dates shared by all stations.
+        train_fraction: Fraction of days assigned to training (exclusive of 0 and 1).
+
+    Returns:
+        Dict with keys ``num_days``, ``train_fraction``, ``test_fraction``,
+        ``split_idx``, ``train_start``, ``train_end``, ``train_days``,
+        ``test_start``, ``test_end``, and ``test_days``.
+
+    Raises:
+        ValueError: If ``train_fraction`` is outside ``(0, 1)`` or yields an empty split.
+    """
     if not 0.0 < train_fraction < 1.0:
         raise ValueError(f"train_fraction must be between 0 and 1, got {train_fraction}")
 
@@ -373,6 +590,13 @@ def print_date_summary(
     common_index: pd.DatetimeIndex,
     split_info: dict[str, pd.Timestamp | int | float],
 ) -> None:
+    """Print human-readable date coverage and train/test split information.
+
+    Args:
+        frames: Per-station DataFrames used to derive coverage.
+        common_index: Intersection of dates across all stations.
+        split_info: Output of ``compute_train_test_ranges``.
+    """
     per_station = summarize_station_date_ranges(frames)
     print("=" * 72)
     print("Pickle date coverage")
@@ -411,6 +635,14 @@ def print_date_summary(
 
 
 def normalize_series(series: pd.Series) -> pd.Series:
+    """Z-score normalise a time series using non-NaN values.
+
+    Args:
+        series: Input daily series indexed by date.
+
+    Returns:
+        Normalised series; demeaned only when standard deviation is zero or non-finite.
+    """
     valid = series.dropna()
     if valid.empty:
         return series
@@ -422,6 +654,14 @@ def normalize_series(series: pd.Series) -> pd.Series:
 
 
 def series_mean(series: pd.Series) -> float:
+    """Compute the mean of non-NaN values in a series.
+
+    Args:
+        series: Input daily series.
+
+    Returns:
+        Mean as float, or ``nan`` when no valid values exist.
+    """
     values = series.dropna()
     if values.empty:
         return float("nan")
@@ -429,6 +669,15 @@ def series_mean(series: pd.Series) -> float:
 
 
 def static_value(frame: pd.DataFrame, column: str) -> float:
+    """Read a time-invariant scalar from a static column in a station frame.
+
+    Args:
+        frame: Station DataFrame that may repeat static attributes on every row.
+        column: Column name for the static attribute.
+
+    Returns:
+        First unique numeric value, or ``nan`` if missing or non-numeric.
+    """
     if column not in frame.columns or frame.empty:
         return float("nan")
     values = pd.to_numeric(frame[column], errors="coerce").dropna().unique()
@@ -442,6 +691,15 @@ def compute_mean_by_doy(
     *,
     clamp_below_zero: bool = True,
 ) -> pd.DataFrame:
+    """Aggregate mean and std by day-of-year for annual cycle plots.
+
+    Args:
+        series: Daily values indexed by datetime.
+        clamp_below_zero: If True, clip values and stats at zero before aggregation.
+
+    Returns:
+        DataFrame indexed by ``day_of_year`` (1–366) with columns ``mean`` and ``std``.
+    """
     values = series.dropna()
     if clamp_below_zero:
         values = values.clip(lower=0.0)
@@ -456,6 +714,14 @@ def compute_mean_by_doy(
 
 
 def _month_axis_ticks(only_3_months: bool) -> tuple[list[int], list[str]]:
+    """Return day-of-year tick positions and month labels for cycle axes.
+
+    Args:
+        only_3_months: If True, show only Jan, Jul, and Dec labels.
+
+    Returns:
+        Tuple ``(tick_doy_list, month_label_list)`` aligned by position.
+    """
     if only_3_months:
         indices = THREE_MONTH_TICK_INDICES
     else:
@@ -468,6 +734,15 @@ def _plot_value_arrays(
     *,
     clamp_below_zero: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract x, mean, and ±1 std band arrays from day-of-year stats.
+
+    Args:
+        stats: DataFrame from ``compute_mean_by_doy`` with ``mean`` and ``std`` columns.
+        clamp_below_zero: If True, clip means, stds, and lower band at zero.
+
+    Returns:
+        Tuple ``(x, mean_values, lower_band, upper_band)`` as numpy arrays.
+    """
     x = stats.index.to_numpy()
     mean_values = stats["mean"].to_numpy(dtype=float)
     std_values = stats["std"].to_numpy(dtype=float)
@@ -482,6 +757,15 @@ def _plot_value_arrays(
 
 
 def _plot_y_max(stats: pd.DataFrame, *, clamp_below_zero: bool = True) -> float:
+    """Return the maximum upper-band value for y-axis scaling.
+
+    Args:
+        stats: Day-of-year statistics DataFrame.
+        clamp_below_zero: Passed through to ``_plot_value_arrays``.
+
+    Returns:
+        Maximum of mean + std, or ``0.0`` when stats are empty.
+    """
     _, _, _, upper_band = _plot_value_arrays(stats, clamp_below_zero=clamp_below_zero)
     if upper_band.size == 0:
         return 0.0
@@ -489,6 +773,15 @@ def _plot_y_max(stats: pd.DataFrame, *, clamp_below_zero: bool = True) -> float:
 
 
 def _plot_y_min(stats: pd.DataFrame, *, clamp_below_zero: bool = True) -> float:
+    """Return the minimum lower-band value for y-axis scaling.
+
+    Args:
+        stats: Day-of-year statistics DataFrame.
+        clamp_below_zero: Passed through to ``_plot_value_arrays``.
+
+    Returns:
+        Minimum of mean − std (clipped at zero when requested), or ``0.0`` when empty.
+    """
     _, _, lower_band, _ = _plot_value_arrays(stats, clamp_below_zero=clamp_below_zero)
     if lower_band.size == 0:
         return 0.0
@@ -500,6 +793,15 @@ def _shared_y_limits(
     *,
     clamp_below_zero: bool = True,
 ) -> tuple[float, float]:
+    """Compute shared y-axis limits across stations for one variable row.
+
+    Args:
+        station_stats: Mapping ``station_id -> day-of-year stats`` DataFrame.
+        clamp_below_zero: Passed through to per-station min/max helpers.
+
+    Returns:
+        Tuple ``(y_min, y_max)`` spanning all stations, or ``(0.0, 0.0)`` when empty.
+    """
     if not station_stats:
         return 0.0, 0.0
     y_min = min(_plot_y_min(stats, clamp_below_zero=clamp_below_zero) for stats in station_stats.values())
@@ -511,6 +813,15 @@ def _temperature_y_limits(
     tmax_stats: dict[str, pd.DataFrame],
     tmin_stats: dict[str, pd.DataFrame],
 ) -> tuple[float, float]:
+    """Compute shared y-axis limits for combined tmax/tmin temperature rows.
+
+    Args:
+        tmax_stats: Per-station tmax day-of-year stats (defines upper bound).
+        tmin_stats: Per-station tmin day-of-year stats (defines lower bound).
+
+    Returns:
+        Tuple ``(y_min, y_max)`` across all stations.
+    """
     y_min = min(_plot_y_min(stats, clamp_below_zero=False) for stats in tmin_stats.values())
     y_max = max(_plot_y_max(stats, clamp_below_zero=False) for stats in tmax_stats.values())
     return y_min, y_max
@@ -523,6 +834,14 @@ def _apply_y_limits(
     y_min: float | None,
     y_max: float | None,
 ) -> None:
+    """Apply y-axis limits to a cycle plot axis.
+
+    Args:
+        axis: Matplotlib axes to configure.
+        clamp_below_zero: If True and only partial limits given, enforce bottom at zero.
+        y_min: Optional lower y limit.
+        y_max: Optional upper y limit.
+    """
     if y_min is not None and y_max is not None:
         axis.set_ylim(y_min, y_max)
     elif y_max is not None:
@@ -539,8 +858,19 @@ def _style_cycle_axis(
     show_ylabel: bool,
     y_label: str,
     show_grid: bool,
-    x_label: str | None = "Day of year",
+    x_label: str | None = None, #"Day of year",
 ) -> None:
+    """Apply shared styling to a mean annual cycle axis.
+
+    Args:
+        axis: Matplotlib axes to style.
+        only_3_months: If True, show three month ticks instead of twelve.
+        show_xlabel: If True, show month tick labels (and optional x-axis label).
+        show_ylabel: If True, set the y-axis label.
+        y_label: Y-axis label text.
+        show_grid: If True, enable a light grid.
+        x_label: Optional x-axis label; omitted when ``None``.
+    """
     month_ticks, month_labels = _month_axis_ticks(only_3_months)
     axis.set_xlim(1, 366)
     axis.set_xticks(month_ticks)
@@ -576,6 +906,30 @@ def plot_mean_cycle(
     show_ylabel: bool = True,
     font_size: float = MEAN_CYCLE_FONT_SIZE,
 ) -> plt.Axes:
+    """Plot mean ± std annual cycle for a single variable and station.
+
+    Args:
+        stats: Day-of-year ``mean``/``std`` DataFrame from ``compute_mean_by_doy``.
+        spec: Variable plot configuration (colours, labels, clamping).
+        station_label: Title text identifying the station.
+        mean_value: Overall mean shown in the subtitle.
+        output_path: PNG path when creating a standalone figure; ignored when ``axis`` is set.
+        show_plot: If True and a new figure is created, call ``plt.show()``.
+        only_3_months: Month tick density on the x-axis.
+        clamp_below_zero: Clip plotted values at zero when True.
+        y_min: Optional shared lower y limit.
+        y_max: Optional shared upper y limit.
+        normalized: If True, use z-score axis/title wording.
+        show_grid: Enable grid lines on the axis.
+        axis: Existing axes for grid embedding; creates a new figure when ``None``.
+        show_title: If True, set title and mean subtitle.
+        show_xlabel: If True, show month labels on the x-axis.
+        show_ylabel: If True, set the y-axis label.
+        font_size: Font size for labels, ticks, and title.
+
+    Returns:
+        The matplotlib ``Axes`` instance used for drawing.
+    """
     x, mean_values, lower_band, upper_band = _plot_value_arrays(
         stats,
         clamp_below_zero=clamp_below_zero,
@@ -583,7 +937,7 @@ def plot_mean_cycle(
     y_label = _mean_cycle_y_label(spec, normalized=normalized)
     title_suffix = f"normalized {spec.label} cycle" if normalized else f"{spec.label} cycle"
     streamflow = spec.key == "streamflow"
-    display_label = _mean_cycle_station_label(station_label)
+    display_label = station_label
 
     if axis is None:
         fig, axis = plt.subplots(1, 1, figsize=(12, 4))
@@ -657,6 +1011,31 @@ def plot_temperature_cycle(
     show_ylabel: bool = True,
     show_legend: bool = True,
 ) -> plt.Axes:
+    """Plot overlaid mean ± std annual cycles for tmax and tmin.
+
+    Args:
+        tmax_stats: Day-of-year stats for maximum temperature.
+        tmin_stats: Day-of-year stats for minimum temperature.
+        station_label: Title text identifying the station.
+        mean_tmax: Overall mean tmax for the subtitle.
+        mean_tmin: Overall mean tmin for the subtitle.
+        output_path: PNG path when creating a standalone figure.
+        show_plot: If True and a new figure is created, call ``plt.show()``.
+        only_3_months: Month tick density on the x-axis.
+        clamp_below_zero: Passed to ``_plot_value_arrays`` (typically False for temperature).
+        y_min: Optional shared lower y limit.
+        y_max: Optional shared upper y limit.
+        normalized: If True, use z-score axis/title wording.
+        show_grid: Enable grid lines on the axis.
+        axis: Existing axes for grid embedding; creates a new figure when ``None``.
+        show_title: If True, set title with mean tmax/tmin values.
+        show_xlabel: If True, show month labels on the x-axis.
+        show_ylabel: If True, set the y-axis label.
+        show_legend: If True (and ``show_title``), show tmax/tmin legend.
+
+    Returns:
+        The matplotlib ``Axes`` instance used for drawing.
+    """
     x_max, max_mean, max_lower, max_upper = _plot_value_arrays(
         tmax_stats,
         clamp_below_zero=clamp_below_zero,
@@ -714,6 +1093,16 @@ def _resolve_series_for_spec(
     common_index: pd.DatetimeIndex,
     spec: VariablePlotSpec,
 ) -> pd.Series:
+    """Extract and align a variable series for one station and plot spec.
+
+    Args:
+        frame: Single-station DataFrame indexed by date.
+        common_index: Dates shared across all stations.
+        spec: Variable plot specification (streamflow or named column candidates).
+
+    Returns:
+        Series of daily values on ``common_index``.
+    """
     if spec.key == "streamflow":
         column = resolve_streamflow_column(frame)
     else:
@@ -728,6 +1117,17 @@ def _build_single_variable_stats(
     *,
     normalize: bool,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, float]]:
+    """Build per-station day-of-year stats and means for one non-temperature variable.
+
+    Args:
+        frames: All station DataFrames.
+        common_index: Shared daily date index.
+        spec: Variable plot specification.
+        normalize: If True, z-score each series before computing day-of-year stats.
+
+    Returns:
+        Tuple ``(station_stats, station_means)`` keyed by ``station_id``.
+    """
     station_stats: dict[str, pd.DataFrame] = {}
     station_means: dict[str, float] = {}
     for station_id, frame in sorted(frames.items()):
@@ -747,6 +1147,17 @@ def _build_temperature_stats(
     *,
     normalize: bool,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, float], dict[str, float]]:
+    """Build per-station tmax/tmin day-of-year stats and overall means.
+
+    Args:
+        frames: All station DataFrames.
+        common_index: Shared daily date index.
+        normalize: If True, z-score tmax and tmin before aggregation.
+
+    Returns:
+        Tuple ``(tmax_stats, tmin_stats, mean_tmax, mean_tmin)``, each keyed by
+        ``station_id``.
+    """
     tmax_stats: dict[str, pd.DataFrame] = {}
     tmin_stats: dict[str, pd.DataFrame] = {}
     mean_tmax: dict[str, float] = {}
@@ -766,6 +1177,14 @@ def _build_temperature_stats(
 
 
 def _mixed_grid_normalize_flags(plot_specs: tuple[VariablePlotSpec, ...]) -> dict[str, bool]:
+    """Return per-variable normalization flags for the mixed grid (streamflow only).
+
+    Args:
+        plot_specs: Ordered variable specs defining grid rows.
+
+    Returns:
+        Mapping ``spec.key -> bool``; only ``streamflow`` is ``True``.
+    """
     flags = {spec.key: False for spec in plot_specs}
     flags["streamflow"] = True
     return flags
@@ -775,14 +1194,40 @@ def _uniform_grid_normalize_flags(
     normalize: bool,
     plot_specs: tuple[VariablePlotSpec, ...],
 ) -> dict[str, bool]:
+    """Return uniform per-variable normalization flags for a grid figure.
+
+    Args:
+        normalize: Flag applied to every variable row.
+        plot_specs: Ordered variable specs defining grid rows.
+
+    Returns:
+        Mapping ``spec.key -> normalize`` for each row.
+    """
     return {spec.key: normalize for spec in plot_specs}
 
 
 def _grid_temperature_ylabel(normalized: bool) -> str:
+    """Return the shared y-axis label for a temperature grid row.
+
+    Args:
+        normalized: If True, use z-score label text.
+
+    Returns:
+        Multi-line y-axis label for tmax/tmin grid rows.
+    """
     return GRID_TEMPERATURE_YLABEL_NORMALIZED if normalized else GRID_TEMPERATURE_YLABEL
 
 
 def _variable_y_label(spec: VariablePlotSpec, *, normalized: bool) -> str:
+    """Return the y-axis label for a single-variable grid or cycle plot.
+
+    Args:
+        spec: Variable plot specification.
+        normalized: If True, use z-score or streamflow-specific normalized labels.
+
+    Returns:
+        Axis label string.
+    """
     if not normalized:
         return spec.y_label
     if spec.key == "streamflow":
@@ -805,6 +1250,25 @@ def plot_basin_variables_grid(
     font_size: float = FONT_SIZE,
     put_only_first_y_ticks: bool = PUT_ONLY_FIRST_Y_TICKS,
 ) -> None:
+    """Write a multi-row, multi-column grid of mean annual cycle plots.
+
+    Rows correspond to variables in ``plot_specs``; columns correspond to
+    ``station_ids``. Output is saved as a single PNG at ``output_path``.
+
+    Args:
+        frames: Per-station daily DataFrames.
+        common_index: Shared date index for alignment.
+        station_ids: Column order for stations in the grid.
+        station_names: ``station_id -> full name`` for column titles.
+        output_path: Destination PNG path (semicolon-separated CSV sibling files are separate).
+        plot_specs: One row per variable (streamflow, precipitation, temperature, etc.).
+        only_3_months: Month tick density on shared x-axes.
+        normalize_by_variable: Per-row z-score flags keyed by ``spec.key``.
+        show_grid: Enable grid lines on each subplot.
+        show_plot: If True, display the figure interactively.
+        font_size: Base font size for grid text.
+        put_only_first_y_ticks: If True, hide y tick labels except in the first column.
+    """
     n_rows = len(plot_specs)
     n_cols = len(station_ids)
     with _plot_font_rc_context(font_size):
@@ -893,7 +1357,7 @@ def plot_basin_variables_grid(
                         show_legend=False,
                     )
                     if show_title:
-                        axis.set_title(station_label)
+                        axis.set_title(_mean_cycle_station_label(station_label))
                     if show_ylabel:
                         axis.set_ylabel(_grid_temperature_ylabel(var_normalize))
                 else:
@@ -933,6 +1397,16 @@ def plot_basin_variables_grid(
 
 
 def format_land_use_fractions(ag: float, forest: float, shrub: float) -> str:
+    """Format agricultural, forest, and herbaceous fractions as ``A/F/V`` percents.
+
+    Args:
+        ag: Agricultural area fraction (0–1 or 0–100).
+        forest: Forest fraction.
+        shrub: Shrub/herbaceous fraction.
+
+    Returns:
+        String like ``45/30/25``, or empty when any input is non-finite.
+    """
     if not all(np.isfinite(value) for value in (ag, forest, shrub)):
         return ""
     values = [ag, forest, shrub]
@@ -945,12 +1419,30 @@ def _station_summary_column_decimals(
     column: str,
     column_decimals: dict[str, int] | None,
 ) -> int:
+    """Resolve decimal places for a station-summary numeric column.
+
+    Args:
+        column: Column name in ``STATION_SUMMARY_NUMERIC_COLUMNS``.
+        column_decimals: Optional per-column override mapping.
+
+    Returns:
+        Number of decimal places to use when rounding.
+    """
     if column_decimals and column in column_decimals:
         return column_decimals[column]
     return DEFAULT_STATION_SUMMARY_DECIMALS
 
 
 def _format_station_summary_number(value: float, decimals: int) -> float | str:
+    """Round a numeric summary value or return empty for non-finite input.
+
+    Args:
+        value: Numeric cell value for the station summary CSV.
+        decimals: Number of decimal places.
+
+    Returns:
+        Rounded float, or empty string when ``value`` is not finite.
+    """
     if not np.isfinite(value):
         return ""
     return round(float(value), decimals)
@@ -965,6 +1457,23 @@ def write_station_summary_csv(
     output_path: Path,
     column_decimals: dict[str, int] | None = None,
 ) -> Path:
+    """Write a semicolon-separated station metadata and flow statistics CSV.
+
+    Output columns: ``ID``, ``STATION NAME``, ``Latitude``, ``Longitude``,
+    ``A/F/V land use (%)``, plus numeric columns in ``STATION_SUMMARY_NUMERIC_COLUMNS``
+    (drainage area, elevation, mean Q, Q10, Q90).
+
+    Args:
+        frames: Per-station daily DataFrames (streamflow and static land-use columns).
+        common_index: Shared dates for flow statistics.
+        static_info: DataFrame indexed by ``station_id`` with lat/lon when available.
+        station_names: ``station_id -> full name`` for the name column.
+        output_path: Destination ``.csv`` path (``;`` separator).
+        column_decimals: Optional per-column rounding overrides.
+
+    Returns:
+        ``output_path`` after writing the file.
+    """
     rows: list[dict[str, str | float]] = []
     for station_id, frame in sorted(frames.items()):
         streamflow_col = resolve_streamflow_column(frame)
@@ -1006,6 +1515,17 @@ def write_station_summary_csv(
 
 
 def write_gnn_lstm_variables_csv(output_path: Path) -> Path:
+    """Write the GNN-LSTM input/output variable catalogue CSV.
+
+    Output columns: ``Variable``, ``GNN-LSTM I/O``, ``Class``, ``Resolution``,
+    ``Source`` — one row per entry in ``GNN_LSTM_VARIABLE_ROWS``.
+
+    Args:
+        output_path: Destination ``.csv`` path (``;`` separator).
+
+    Returns:
+        ``output_path`` after writing the file.
+    """
     rows = [
         {
             "Variable": variable,
@@ -1034,6 +1554,25 @@ def _plot_variable_set(
     show_grid: bool,
     show_plot: bool,
 ) -> int:
+    """Generate per-station mean-cycle PNGs for one variable under ``output_root``.
+
+    Files are written to ``output_root / spec.key / mean_{key}_{station_id}[_normalized].png``.
+
+    Args:
+        frames: Per-station daily DataFrames.
+        common_index: Shared date index.
+        station_names: Station ID to display-name mapping.
+        output_root: Root directory for variable subfolders.
+        spec: Variable to plot (single-variable or temperature).
+        only_3_months: Month tick density on cycle axes.
+        same_y_axis: If True, use shared y limits across stations.
+        normalize: If True, plot z-scored series and append ``_normalized`` to filenames.
+        show_grid: Enable grid lines on plots.
+        show_plot: If True, display each figure interactively.
+
+    Returns:
+        Number of PNG files written.
+    """
     variable_dir = output_root / spec.key
     variable_dir.mkdir(parents=True, exist_ok=True)
     plots_written = 0
@@ -1135,6 +1674,29 @@ def run_basin_summary_analysis(
     put_only_first_y_ticks: bool = PUT_ONLY_FIRST_Y_TICKS,
     show_plot: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, pd.Timestamp | int | float]]:
+    """Run the full basin summary pipeline: dates, plots, grids, and CSV exports.
+
+    Reads multi-station pickle data, prints date/train-test summaries, writes
+    per-variable mean-cycle PNGs, combined grid figures, ``station_summary.csv``,
+    and ``gnn_lstm_variables.csv`` under ``{visuals_dir}/basin_summary_graphics/``.
+
+    Args:
+        pickle_path: Input ``dict[str, DataFrame]`` pickle (daily time series).
+        visuals_dir: Root directory; outputs go to ``basin_summary_graphics`` subdirectory.
+        static_info_path: CSV with station names and coordinates.
+        train_fraction: Chronological train split fraction for printed summary only.
+        only_3_months: Use three month labels on cycle plot x-axes.
+        same_y_axis: Share y-axis limits across stations within each variable.
+        normalize: Also emit z-score plots and ``_normalized`` grid variants.
+        show_grid: Draw grid lines on plots.
+        include_atmospheric_indexes: Include SPEI, NAO, and WEMO in plots/grids.
+        font_size: Base plot font size.
+        put_only_first_y_ticks: Hide y tick labels except in the first grid column.
+        show_plot: Display figures interactively instead of only saving PNGs.
+
+    Returns:
+        Tuple of ``(per_station_date_ranges, split_info)`` from summarisation helpers.
+    """
     frames = load_pickle_stations(pickle_path)
     common_index = common_date_index(frames)
     split_info = compute_train_test_ranges(common_index, train_fraction=train_fraction)
@@ -1214,6 +1776,11 @@ def run_basin_summary_analysis(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for basin summary graphics generation.
+
+    Returns:
+        Parsed namespace with paths, plot options, and display flags.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Summarize pickle date ranges, report an 80/20 train-test day split, "
@@ -1316,6 +1883,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Entry point: parse CLI args and run ``run_basin_summary_analysis``."""
     args = _parse_args()
     run_basin_summary_analysis(
         pickle_path=args.pickle_path,

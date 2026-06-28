@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Inspect pickle datasets for structure, coverage, and data-quality checks.
+
+Loads station dictionaries from configured Windows/WSL paths and prints
+column schemas, date ranges, missing-value summaries, and README consistency
+checks across all stations.
+"""
 from __future__ import annotations
 
 from pathlib import PureWindowsPath
@@ -37,6 +43,13 @@ def windows_to_wsl_path(path: str) -> str:
 
 
 def preview_object(data: Any) -> None:
+    """Print a concise structural preview of an arbitrary loaded Python object.
+
+    Handles pandas objects, dicts, lists/tuples, and falls back to ``repr``.
+
+    Args:
+        data: Object loaded from pickle or another serialization format.
+    """
     print(f"Loaded object type: {type(data)}")
 
     # pandas-like objects
@@ -75,6 +88,15 @@ def preview_object(data: Any) -> None:
 
 
 def summarize_station_dictionary(data: dict[str, Any]) -> None:
+    """Print dataset-wide quality checks for a station-id to DataFrame mapping.
+
+    Expected pickle structure:
+        ``dict[str, pd.DataFrame]`` where each DataFrame is indexed by daily
+        dates and contains columns listed in ``EXPECTED_COLUMNS``.
+
+    Args:
+        data: Station dictionary loaded from an inputs pickle file.
+    """
     station_ids = sorted(data.keys())
     print(f"\nStations: {len(station_ids)}")
     print(f"First station IDs: {station_ids[:10]}{' ...' if len(station_ids) > 10 else ''}")
@@ -145,6 +167,7 @@ def summarize_station_dictionary(data: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """Load configured pickle files and print exploration summaries."""
     pickle_path = windows_to_wsl_path(WINDOWS_PICKLE_PATH)
     print(f"Opening pickle file: {pickle_path}")
 

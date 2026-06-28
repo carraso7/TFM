@@ -1,3 +1,21 @@
+"""Build adjacency matrices and map visualizations for GNN station graphs.
+
+This module constructs binary and distance-weighted adjacency matrices from
+hydrological station relations, exports GeoPackage layers for QGIS, and renders
+interactive Bokeh maps with basemap tiles.
+
+Input data:
+    static_info (CSV or DataFrame): Station metadata with columns ``station_id``,
+        ``Station name``, ``Latitude``, ``Longitude``, and optional ``Catchment
+        area`` and ``Elevation``.
+
+Output structures:
+    Adjacency matrices are square ``pandas.DataFrame`` objects indexed and
+        columned by ``station_id`` (0/1 for connectivity, float meters for
+        weighted matrices).
+    GeoPackage exports contain ``nodes`` and optional ``edges`` layers.
+    HTML maps are self-contained Bokeh files saved under ``code/visuals/``.
+"""
 
 import math
 from pathlib import Path
@@ -31,6 +49,19 @@ DEFAULT_STATION_IDS: list[str] | None = None
 DEFAULT_VISUALS_DIR = Path(__file__).resolve().parent / "visuals"
 
 def _build_name_to_id(static_info: pd.DataFrame | str | Path) -> dict[str, str]:
+	"""Map normalized station names to station IDs.
+
+	Args:
+		static_info: Station metadata CSV path or DataFrame with ``Station name``
+			and ``station_id`` columns.
+
+	Returns:
+		Dictionary keyed by lowercased station name (or disambiguated duplicate
+		key) mapping to zero-padded station ID strings.
+
+	Raises:
+		ValueError: If ``Station name`` is missing or duplicate mappings conflict.
+	"""
 	if isinstance(static_info, (str, Path)):
 		static_info_df = pd.read_csv(static_info, dtype={"station_id": str})
 	else:
@@ -64,6 +95,23 @@ def create_adj_matrix_hydrological(
 	relations: list[tuple[str, str]],
 	static_info: pd.DataFrame | str | Path | None = None,
 ) -> pd.DataFrame:
+	"""Build a directed hydrological adjacency matrix from upstream relations.
+
+	Args:
+		station_ids: Ordered list of station IDs to include as nodes, or ``None``
+			to infer nodes from ``relations`` only.
+		relations: List of ``(source, target)`` tuples; values may be station IDs
+			or station names resolvable via ``static_info``.
+		static_info: Optional CSV path or DataFrame for name-to-ID resolution.
+
+	Returns:
+		Square DataFrame of 0/1 adjacency values with index and columns equal to
+		sorted station IDs.
+
+	Raises:
+		ValueError: If a relation references an unknown station when
+			``station_ids`` is provided.
+	"""
 	name_to_id: dict[str, str] = {}
 	if static_info is not None:
 		name_to_id = _build_name_to_id(static_info)
@@ -71,6 +119,7 @@ def create_adj_matrix_hydrological(
 	station_id_set = set(str(station_id) for station_id in station_ids or [])
 
 	def _resolve_station_id(value: str) -> str:
+		"""Resolve a relation endpoint to a station ID or name lookup."""
 		value_str = str(value)
 		if station_id_set and value_str in station_id_set:
 			return value_str
@@ -99,6 +148,18 @@ def create_adj_matrix_dense(
 	relations: list[tuple[str, str]],
 	static_info: pd.DataFrame | str | Path | None = None,
 ) -> pd.DataFrame:
+	"""Build a fully connected directed adjacency matrix (excluding self-loops).
+
+	Args:
+		station_ids: Station IDs to include; see
+			:func:`create_adj_matrix_hydrological`.
+		relations: Hydrological edges used to determine node ordering.
+		static_info: Optional metadata for name resolution.
+
+	Returns:
+		Square DataFrame with ones for every off-diagonal pair and zeros on the
+		diagonal, using the node order from the hydrological graph.
+	"""
 	base_matrix = create_adj_matrix_hydrological(station_ids, relations, static_info)
 	node_order = list(base_matrix.index)
 	n = len(node_order)
@@ -112,6 +173,21 @@ def create_adj_matrix_all_paths(
 	relations: list[tuple[str, str]],
 	static_info: pd.DataFrame | str | Path | None = None,
 ) -> pd.DataFrame:
+	"""Build an adjacency matrix marking all reachable station pairs.
+
+	Uses matrix power on the hydrological graph (with self-loops) to mark pairs
+	connected by any directed path.
+
+	Args:
+		station_ids: Station IDs to include; see
+			:func:`create_adj_matrix_hydrological`.
+		relations: Hydrological edges defining the base graph.
+		static_info: Optional metadata for name resolution.
+
+	Returns:
+		Square 0/1 DataFrame where entry ``(i, j)`` is 1 if a directed path exists
+		from station *i* to station *j* (excluding self-loops on the diagonal).
+	"""
 	adj_matrix = create_adj_matrix_hydrological(station_ids, relations, static_info)
 	n = len(adj_matrix)
 	matrix_with_diag = adj_matrix.to_numpy(dtype=int).copy()
@@ -128,6 +204,17 @@ def create_adj_matrix_all_paths(
 
 
 def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+	"""Compute great-circle distance between two WGS84 points in meters.
+
+	Args:
+		lat1: Latitude of the first point in degrees.
+		lon1: Longitude of the first point in degrees.
+		lat2: Latitude of the second point in degrees.
+		lon2: Longitude of the second point in degrees.
+
+	Returns:
+		Haversine distance in meters.
+	"""
 	radius = 6371000.0
 	phi1 = math.radians(lat1)
 	phi2 = math.radians(lat2)
@@ -143,6 +230,15 @@ def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
 
 
 def _lonlat_to_mercator(lon: float, lat: float) -> tuple[float, float]:
+	"""Project WGS84 lon/lat to Web Mercator (EPSG:3857) coordinates.
+
+	Args:
+		lon: Longitude in degrees.
+		lat: Latitude in degrees.
+
+	Returns:
+		Tuple ``(x, y)`` in meters.
+	"""
 	r_major = 6378137.0
 	x = math.radians(lon) * r_major
 	lat = max(min(lat, 89.9999), -89.9999)
@@ -154,6 +250,20 @@ def _load_station_features(
 	static_info_path: str | Path,
 	station_ids: list[str],
 ) -> list[dict[str, object]]:
+	"""Load per-station geographic and catchment attributes from static info.
+
+	Args:
+		static_info_path: CSV with ``station_id``, ``Station name``, ``Latitude``,
+			``Longitude``, and optional ``Catchment area`` / ``Elevation``.
+		station_ids: Station IDs to load.
+
+	Returns:
+		List of dicts with keys ``station_id``, ``station_name``, ``lat``, ``lon``,
+		``catchment_area``, and ``elevation``.
+
+	Raises:
+		ValueError: If a station is missing or lacks coordinates.
+	"""
 	static_info_df = pd.read_csv(static_info_path, dtype={"station_id": str})
 	static_info_df = static_info_df.set_index("station_id")
 
@@ -192,6 +302,16 @@ def _project_lonlat_to_crs(
 	lat: float,
 	crs: str = DEFAULT_QGIS_CRS,
 ) -> tuple[float, float]:
+	"""Project a WGS84 point to the target CRS.
+
+	Args:
+		lon: Longitude in degrees (EPSG:4326).
+		lat: Latitude in degrees (EPSG:4326).
+		crs: Target projected CRS string (default EPSG:25830).
+
+	Returns:
+		Tuple ``(x, y)`` in the target CRS units.
+	"""
 	point_gdf = gpd.GeoDataFrame(
 		geometry=[Point(lon, lat)],
 		crs="EPSG:4326",
@@ -207,6 +327,19 @@ def _build_edge_features(
 	coord_lookup: dict[str, tuple[float, float]],
 	arrow_offset_m: float = DEFAULT_ARROW_OFFSET_M,
 ) -> list[dict[str, object]]:
+	"""Build edge geometry records for non-zero adjacency weights.
+
+	Args:
+		station_ids: Node IDs in graph order.
+		weighted_adj_matrix: Square DataFrame of edge weights (meters); zeros
+			mean no edge.
+		coord_lookup: Mapping from station ID to projected ``(x, y)`` coordinates.
+		arrow_offset_m: Distance in meters to shorten edge endpoints for arrow
+			heads.
+
+	Returns:
+		List of edge dicts with endpoint coordinates and ``weight_m`` / ``weight_km``.
+	"""
 	edges: list[dict[str, object]] = []
 	for source_id in station_ids:
 		for target_id in station_ids:
@@ -244,6 +377,19 @@ def _to_geodataframes(
 	crs: str = DEFAULT_QGIS_CRS,
 	node_extra_attributes: dict[str, dict[str, object]] | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame | None]:
+	"""Convert station and edge feature dicts to GeoDataFrames.
+
+	Args:
+		stations: Output of :func:`_load_station_features`.
+		edges: Optional edge records from :func:`_build_edge_features`.
+		crs: CRS for output geometries.
+		node_extra_attributes: Optional per-station attribute dicts merged into
+			node records.
+
+	Returns:
+		Tuple of ``(nodes_gdf, edges_gdf)``; ``edges_gdf`` is ``None`` when
+		``edges`` is empty.
+	"""
 	node_records: list[dict[str, object]] = []
 	for station in stations:
 		x, y = _project_lonlat_to_crs(station["lon"], station["lat"], crs=crs)
@@ -293,6 +439,21 @@ def export_graph_for_qgis(
 	crs: str = DEFAULT_QGIS_CRS,
 	node_extra_attributes: dict[str, dict[str, object]] | None = None,
 ) -> Path:
+	"""Export station nodes and optional weighted edges to a GeoPackage.
+
+	Args:
+		output_dir: Directory that will contain the GeoPackage file.
+		gpkg_name: Output filename (``.gpkg``).
+		static_info_path: CSV path for station coordinates and metadata.
+		station_ids: Station IDs to export as node features.
+		weighted_adj_matrix: Optional square weight matrix; when provided, an
+			``edges`` layer is written with line geometries and ``weight_m``.
+		crs: Projected CRS for geometries (default EPSG:25830).
+		node_extra_attributes: Optional extra columns per station for QGIS.
+
+	Returns:
+		Path to the written GeoPackage file.
+	"""
 	output_path = Path(output_dir)
 	output_path.mkdir(parents=True, exist_ok=True)
 	gpkg_path = output_path / gpkg_name
@@ -335,6 +496,20 @@ def create_weighted_adj_matrix_distances_from_adj(
 	adj_matrix: pd.DataFrame,
 	static_info_path: str | Path,
 ) -> pd.DataFrame:
+	"""Assign haversine edge weights (meters) for every non-zero adjacency entry.
+
+	Args:
+		adj_matrix: Square 0/1 adjacency DataFrame indexed by station ID.
+		static_info_path: CSV with ``station_id``, ``Latitude``, and ``Longitude``.
+
+	Returns:
+		Square DataFrame of geodesic distances in meters; zeros where
+		``adj_matrix`` is zero.
+
+	Raises:
+		TypeError: If ``adj_matrix`` is not a DataFrame.
+		ValueError: If index/columns mismatch or coordinates are missing.
+	"""
 	if not isinstance(adj_matrix, pd.DataFrame):
 		raise TypeError("adj_matrix must be a pandas DataFrame")
 	if list(adj_matrix.index) != list(adj_matrix.columns):
@@ -374,6 +549,22 @@ def create_weighted_adj_matrix_all_river_distances_from_hydrological(
 	adj_matrix: pd.DataFrame,
 	static_info_path: str | Path,
 ) -> pd.DataFrame:
+	"""Weight all reachable pairs by summed river-network geodesic distance.
+
+	Direct hydrological edges use point-to-point haversine distance; indirect
+	pairs use the shortest path through the hydrological graph.
+
+	Args:
+		adj_matrix: Square hydrological 0/1 adjacency DataFrame.
+		static_info_path: CSV with station coordinates.
+
+	Returns:
+		Square DataFrame of path distances in meters for all reachable pairs.
+
+	Raises:
+		TypeError: If ``adj_matrix`` is not a DataFrame.
+		ValueError: If index/columns mismatch or coordinates are missing.
+	"""
 	if not isinstance(adj_matrix, pd.DataFrame):
 		raise TypeError("hydrological_adj_matrix must be a pandas DataFrame")
 	if list(adj_matrix.index) != list(adj_matrix.columns):
@@ -397,6 +588,7 @@ def create_weighted_adj_matrix_all_river_distances_from_hydrological(
 	n = len(node_order)
 
 	def _geo_distance(source_id: str, target_id: str) -> float:
+		"""Return haversine distance between two stations in meters."""
 		lat1, lon1 = coords[source_id]
 		lat2, lon2 = coords[target_id]
 		return _haversine_meters(lat1, lon1, lat2, lon2)
@@ -453,6 +645,23 @@ def plot_weighted_graph_map(
 	output_qgis_dir: str | Path | None = None,
 	qgis_gpkg_name: str = "weighted_graph.gpkg",
 ) -> None:
+	"""Render an interactive map of the weighted station graph.
+
+	Args:
+		weighted_adj_matrix: Square distance-weighted adjacency DataFrame (meters).
+		static_info_path: CSV with station metadata and coordinates.
+		output_html: Optional path for a standalone Bokeh HTML file.
+		show_plot: If True, open the plot in a browser.
+		map_tile_url: WMTS basemap tile URL template.
+		map_tile_attribution: HTML attribution string for the basemap.
+		output_qgis_dir: Optional directory for GeoPackage export via
+			:func:`export_graph_for_qgis`.
+		qgis_gpkg_name: GeoPackage filename when exporting for QGIS.
+
+	Raises:
+		TypeError: If ``weighted_adj_matrix`` is not a DataFrame.
+		ValueError: If matrix dimensions mismatch or station metadata is invalid.
+	"""
 	if not isinstance(weighted_adj_matrix, pd.DataFrame):
 		raise TypeError("weighted_adj_matrix must be a pandas DataFrame")
 	if list(weighted_adj_matrix.index) != list(weighted_adj_matrix.columns):
@@ -698,6 +907,22 @@ def show_only_nodes(
 	output_qgis_dir: str | Path | None = None,
 	qgis_gpkg_name: str = "nodes_only.gpkg",
 ) -> None:
+	"""Render a basemap with station nodes only (no edges).
+
+	Args:
+		station_ids: Station IDs to plot.
+		static_info_path: CSV with ``station_id``, ``Station name``, ``Latitude``,
+			and ``Longitude``.
+		output_html: Optional Bokeh HTML output path.
+		show_plot: If True, open the plot in a browser.
+		map_tile_url: WMTS basemap tile URL template.
+		map_tile_attribution: HTML attribution for the basemap.
+		output_qgis_dir: Optional directory for a nodes-only GeoPackage export.
+		qgis_gpkg_name: GeoPackage filename for QGIS export.
+
+	Raises:
+		ValueError: If a station is missing from static info or lacks coordinates.
+	"""
 	static_info_df = pd.read_csv(static_info_path, dtype={"station_id": str})
 	static_info_df = static_info_df.set_index("station_id")
 
@@ -805,6 +1030,22 @@ def create_weighted_adj_matrix_all_river_distances(
 	static_info: pd.DataFrame | str | Path | None = None,
 	verbose: int = 0,
 ) -> pd.DataFrame:
+	"""Build a river-distance weighted matrix from hydrological relations.
+
+	Convenience wrapper around
+	:func:`create_weighted_adj_matrix_all_river_distances_from_hydrological`.
+
+	Args:
+		station_ids: Station IDs to include; see
+			:func:`create_adj_matrix_hydrological`.
+		relations: Hydrological upstream/downstream tuples.
+		static_info: CSV path or DataFrame for name resolution and coordinates.
+		verbose: If greater than zero, print the intermediate binary adjacency
+			matrix.
+
+	Returns:
+		Square DataFrame of path-weighted distances in meters.
+	"""
 	adj_matrix = create_adj_matrix_hydrological(station_ids, relations, static_info)
 	if verbose > 0:
 		print(adj_matrix)
@@ -817,6 +1058,20 @@ def create_weighted_adj_matrix_all_paths(
 	static_info: pd.DataFrame | str | Path | None = None,
 	verbose: int = 0,
 ) -> pd.DataFrame:
+	"""Build a geodesic weighted matrix for all reachable station pairs.
+
+	Uses the all-paths binary adjacency and assigns direct haversine distances.
+
+	Args:
+		station_ids: Station IDs to include.
+		relations: Hydrological relation tuples.
+		static_info: CSV path or DataFrame for resolution and coordinates.
+		verbose: If greater than zero, print the intermediate binary adjacency
+			matrix.
+
+	Returns:
+		Square DataFrame of geodesic edge weights in meters.
+	"""
 	adj_matrix = create_adj_matrix_all_paths(station_ids, relations, static_info)
 	if verbose > 0:
 		print(adj_matrix)
@@ -829,6 +1084,18 @@ def create_weighted_adj_matrix_hydrological(
 	static_info: pd.DataFrame | str | Path | None = None,
 	verbose: int = 0,
 ) -> pd.DataFrame:
+	"""Build a geodesic weighted matrix for direct hydrological edges only.
+
+	Args:
+		station_ids: Station IDs to include.
+		relations: Hydrological relation tuples.
+		static_info: CSV path or DataFrame for resolution and coordinates.
+		verbose: If greater than zero, print the intermediate binary adjacency
+			matrix.
+
+	Returns:
+		Square DataFrame with haversine distances on hydrological edges.
+	"""
 	adj_matrix = create_adj_matrix_hydrological(station_ids, relations, static_info)
 	if verbose > 0:
 		print(adj_matrix)
@@ -841,16 +1108,33 @@ def create_weighted_adj_matrix_dense(
 	static_info: pd.DataFrame | str | Path | None = None,
 	verbose: int = 0,
 ) -> pd.DataFrame:
+	"""Build a geodesic weighted matrix for a fully connected graph.
+
+	Args:
+		station_ids: Station IDs to include.
+		relations: Hydrological relation tuples (used for node ordering).
+		static_info: CSV path or DataFrame for resolution and coordinates.
+		verbose: If greater than zero, print the intermediate binary adjacency
+			matrix.
+
+	Returns:
+		Square DataFrame with haversine distances on every off-diagonal pair.
+	"""
 	adj_matrix = create_adj_matrix_dense(station_ids, relations, static_info)
 	if verbose > 0:
 		print(adj_matrix)
 	return create_weighted_adj_matrix_distances_from_adj(adj_matrix, static_info)
 
 
-
 create_weighted_adj_matrix = create_weighted_adj_matrix_hydrological
 
+
 def main() -> None:
+	"""Generate default weighted-graph and nodes-only map exports.
+
+	Writes HTML maps and QGIS GeoPackages under ``code/visuals/`` using
+	``DEFAULT_RELATIONS`` and ``DEFAULT_STATIC_INFO_PATH``.
+	"""
 	DEFAULT_VISUALS_DIR.mkdir(parents=True, exist_ok=True)
 	weighted_adj_matrix = create_weighted_adj_matrix(
 		station_ids=DEFAULT_STATION_IDS,

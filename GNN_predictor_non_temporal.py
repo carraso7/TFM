@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Non-temporal GNN for multi-station daily streamflow prediction.
+
+Builds graph-window datasets from pickle inputs, trains a message-passing GNN
+with MLP encoder/decoder, and exports prediction and error visualizations.
+"""
 from __future__ import annotations
 
 import pickle
@@ -270,6 +275,15 @@ def _normalize_adj_only_diag(adj: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_adj_row_norm(adj: torch.Tensor, self_loops: bool = True) -> torch.Tensor:
+    """Row-normalize an adjacency matrix, optionally adding self-loops first.
+
+    Args:
+        adj: Square adjacency tensor of shape ``(N, N)``.
+        self_loops: If ``True``, set the diagonal to 1.0 before normalization.
+
+    Returns:
+        Row-normalized adjacency with the same shape and dtype as ``adj``.
+    """
     adj = adj.clone()
     if self_loops:
         adj.fill_diagonal_(1.0)
@@ -321,6 +335,7 @@ class GraphWindowDataset(Dataset):
         start_idx: int,
         end_idx: int,
     ) -> None:
+        """Initialize a graph-window dataset split over synchronized stations."""
         self.series = series
         self.window_days = window_days
         self.start_idx = start_idx
@@ -390,6 +405,7 @@ class MLPEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map node features to hidden embeddings."""
         return self.net(x)
 
 
@@ -420,6 +436,7 @@ class MLPDecoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map node embeddings to scalar streamflow predictions."""
         return self.net(x)
 
 
@@ -456,6 +473,7 @@ class SimpleGNN(nn.Module):
             node in every sample of the batch.
     """
     def __init__(self, input_dim: int, hidden_dim: int, message_passes: int, adj: torch.Tensor) -> None:
+        """Register encoder/decoder modules and the normalized adjacency buffer."""
         super().__init__()
         self.encoder = MLPEncoder(input_dim, hidden_dim)
         self.decoder = MLPDecoder(hidden_dim)
@@ -466,6 +484,7 @@ class SimpleGNN(nn.Module):
     
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode nodes, propagate messages, and decode streamflow predictions."""
         h = self.encoder(x)
         for _ in range(self.message_passes):
             h = h + torch.relu(torch.einsum("ij,bjh->bih", self.adj, h))
@@ -625,6 +644,7 @@ def print_model_summary(model: SimpleGNN, batch_size: int = 1) -> None:
     print(sep)
 
 def main() -> None:
+    """Train the default non-temporal GNN and generate evaluation plots."""
     adj_matrix = create_adj_matrix(
         station_ids=DEFAULT_STATION_IDS,
         relations=DEFAULT_RELATIONS,

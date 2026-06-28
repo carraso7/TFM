@@ -50,6 +50,7 @@ DEFAULT_EDGES: list[tuple[str, str]] = [
 
 
 def _edges_to_tokens(edges: list[tuple[str, str]]) -> list[str]:
+    """Convert ``(source, target)`` edge pairs to CLI-friendly comma tokens."""
     return [f"{source},{target}" for source, target in edges]
 
 SHORT_VALUE_COLUMNS = [
@@ -111,6 +112,17 @@ MERGE_COMPARE_RTOL = 1e-9
 
 
 def _parse_station_id_from_input_path(path: Path) -> str | None:
+    """Infer a station id from an input filename stem.
+
+    Tries the shared filename parser first, then ``A###`` and generic
+    three-digit patterns.
+
+    Args:
+        path: Input pickle or text file path.
+
+    Returns:
+        Normalized three-digit station id, or ``None`` if not found.
+    """
     station_id = _parse_station_id_from_filename(path)
     if station_id:
         return station_id
@@ -126,12 +138,24 @@ def _parse_station_id_from_input_path(path: Path) -> str | None:
 
 
 def _iter_station_frames(data: dict[str, Any]) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield DataFrame entries from a pickle station dictionary."""
     for station_id, value in data.items():
         if isinstance(value, pd.DataFrame):
             yield str(station_id), value
 
 
 def _find_text_header_line(path: Path) -> int:
+    """Locate the zero-based header line in a SAIH semicolon-separated text file.
+
+    Args:
+        path: Station export ``.txt`` or ``.csv`` file.
+
+    Returns:
+        Line number of the data header row.
+
+    Raises:
+        ValueError: If no recognizable header line is found.
+    """
     with path.open("r", encoding="latin-1", errors="replace") as handle:
         for line_number, line in enumerate(handle):
             stripped = line.strip()
@@ -146,6 +170,19 @@ def _find_text_header_line(path: Path) -> int:
 
 
 def _load_text_station_file(path: Path, station_id: str | None = None) -> tuple[str, pd.DataFrame]:
+    """Load one semicolon-separated SAIH station file into a DataFrame.
+
+    Args:
+        path: Text file with header metadata followed by a daily data table.
+        station_id: Optional explicit station id override.
+
+    Returns:
+        Tuple ``(station_id, dataframe)`` indexed by date with columns from
+        ``TEXT_DATA_COLUMNS``.
+
+    Raises:
+        ValueError: If the station id or required columns cannot be resolved.
+    """
     resolved_station_id = station_id or _parse_station_id_from_input_path(path)
     if not resolved_station_id:
         raise ValueError(
@@ -176,6 +213,17 @@ def _load_text_station_file(path: Path, station_id: str | None = None) -> tuple[
 
 
 def _load_pickle_file(path: Path) -> dict[str, pd.DataFrame]:
+    """Load a pickle containing ``dict[str, pd.DataFrame]`` station data.
+
+    Args:
+        path: Pickle file path.
+
+    Returns:
+        Dict keyed by string station id with DataFrame values only.
+
+    Raises:
+        TypeError: If the pickle root object is not a dict of DataFrames.
+    """
     with path.open("rb") as handle:
         data = pickle.load(handle)
     if not isinstance(data, dict):
@@ -184,6 +232,7 @@ def _load_pickle_file(path: Path) -> dict[str, pd.DataFrame]:
 
 
 def _align_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the index to midnight datetimes and sort chronologically."""
     aligned_df = df.copy()
     if not isinstance(aligned_df.index, pd.DatetimeIndex):
         aligned_df.index = pd.to_datetime(aligned_df.index, errors="coerce")
@@ -193,6 +242,7 @@ def _align_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dynamic_columns_in_df(df: pd.DataFrame) -> list[str]:
+    """Return dynamic value columns present in a station DataFrame."""
     for candidates in (SHORT_VALUE_COLUMNS, LONG_VALUE_COLUMNS):
         present = [column for column in candidates if column in df.columns]
         if present:
@@ -205,6 +255,7 @@ def _dynamic_columns_in_df(df: pd.DataFrame) -> list[str]:
 
 
 def _static_value_from_frame(df: pd.DataFrame, column: str) -> float | None:
+    """Read a single time-invariant scalar from the first valid row of a column."""
     if column not in df.columns or df.empty:
         return None
     values = pd.to_numeric(df[column], errors="coerce").dropna().unique()
@@ -215,6 +266,8 @@ def _static_value_from_frame(df: pd.DataFrame, column: str) -> float | None:
 
 @dataclass
 class StaticMergeDifference:
+    """Record of a static attribute mismatch when merging input files."""
+
     station_id: str
     column: str
     earlier_files: str
@@ -226,6 +279,8 @@ class StaticMergeDifference:
 
 @dataclass
 class InputMergeLog:
+    """Accumulator for dynamic and static differences found while merging inputs."""
+
     dynamic_rows: list[dict[str, Any]] = field(default_factory=list)
     static_differences: list[StaticMergeDifference] = field(default_factory=list)
 
@@ -240,6 +295,7 @@ class InputMergeLog:
         atol: float = MERGE_COMPARE_ATOL,
         rtol: float = MERGE_COMPARE_RTOL,
     ) -> None:
+        """Compare overlapping station frames and record dynamic/static differences."""
         earlier_label = "; ".join(earlier_files)
         stored_file = later_file
         existing_aligned = _align_dataframe(existing)
@@ -345,6 +401,7 @@ class InputMergeLog:
                 )
 
     def has_dynamic_differences(self) -> bool:
+        """Return ``True`` if any dynamic column has differing overlapping days."""
         return any(
             isinstance(row.get("differing_days"), (int, np.integer))
             and int(row["differing_days"]) > 0
@@ -352,9 +409,15 @@ class InputMergeLog:
         )
 
     def has_static_differences(self) -> bool:
+        """Return ``True`` if any static attribute mismatch was recorded."""
         return bool(self.static_differences)
 
     def write_dynamic_csv(self, output_path: Path) -> Path | None:
+        """Write dynamic merge comparisons to CSV if any rows were recorded.
+
+        Returns:
+            Output path when written, otherwise ``None``.
+        """
         if not self.dynamic_rows:
             return None
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,6 +425,11 @@ class InputMergeLog:
         return output_path
 
     def write_static_csv(self, output_path: Path) -> Path | None:
+        """Write static merge differences to CSV if any were recorded.
+
+        Returns:
+            Output path when written, otherwise ``None``.
+        """
         if not self.static_differences:
             return None
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +452,7 @@ class InputMergeLog:
         return output_path
 
     def print_static_differences(self) -> None:
+        """Print a human-readable summary of static merge conflicts."""
         if not self.static_differences:
             print("\nStatic info: no differences found while merging input files.")
             return
@@ -465,6 +534,11 @@ def load_input_files(
 
 
 def _parse_edge_token(token: str) -> tuple[str, str]:
+    """Parse a graph edge token in ``source,target`` or ``source->target`` form.
+
+    Raises:
+        ValueError: If the token cannot be parsed into two station ids.
+    """
     token = token.strip()
     if "->" in token:
         source, target = token.split("->", 1)
@@ -480,11 +554,23 @@ def _parse_edge_token(token: str) -> tuple[str, str]:
 
 
 def _looks_like_edge(token: str) -> bool:
+    """Return ``True`` if a CLI token appears to describe a directed edge."""
     token = token.strip()
     return "->" in token or "," in token
 
 
 def parse_stations_or_edges(tokens: list[str]) -> tuple[list[str] | None, list[tuple[str, str]] | None]:
+    """Parse CLI tokens as either station ids or graph edges.
+
+    Args:
+        tokens: Station ids and/or edge tokens from the command line.
+
+    Returns:
+        Tuple ``(station_ids, edges)`` where exactly one entry is ``None``.
+
+    Raises:
+        ValueError: If no tokens are supplied or an edge token is invalid.
+    """
     if not tokens:
         raise ValueError("At least one station id or edge must be provided")
 
@@ -500,6 +586,7 @@ def resolve_station_ids(
     station_ids: list[str] | None,
     edges: list[tuple[str, str]] | None,
 ) -> list[str]:
+    """Resolve the final sorted station list from ids or edge endpoints."""
     if station_ids is not None:
         return sorted(dict.fromkeys(station_ids))
 
@@ -517,6 +604,7 @@ def resolve_station_ids(
 
 
 def _resolve_available_station_id(requested_id: str, available_ids: set[str]) -> str | None:
+    """Match a requested station id to an available key, ignoring leading zeros."""
     normalized = _normalize_station_id(requested_id)
     if normalized in available_ids:
         return normalized
@@ -532,6 +620,11 @@ def filter_station_data(
     data: dict[str, pd.DataFrame],
     requested_station_ids: list[str],
 ) -> dict[str, pd.DataFrame]:
+    """Subset a station dictionary to the requested ids.
+
+    Raises:
+        ValueError: If any requested station is missing from ``data``.
+    """
     available_ids = set(data.keys())
     filtered: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
@@ -557,12 +650,16 @@ MAX_MISSING_VALUE_DATES_TO_PRINT = 25
 
 @dataclass(frozen=True)
 class MissingValueDetail:
+    """One missing dynamic value at a specific station date."""
+
     column: str
     date: pd.Timestamp
 
 
 @dataclass(frozen=True)
 class StationSummary:
+    """Coverage and missing-data summary for one station."""
+
     station_id: str
     name: str
     first_day: pd.Timestamp
@@ -573,6 +670,7 @@ class StationSummary:
 
 
 def _value_columns(df: pd.DataFrame) -> list[str]:
+    """Return dynamic value columns present in a station DataFrame."""
     for candidates in (SHORT_VALUE_COLUMNS, LONG_VALUE_COLUMNS):
         present = [column for column in candidates if column in df.columns]
         if present:
@@ -585,6 +683,15 @@ def _value_columns(df: pd.DataFrame) -> list[str]:
 
 
 def load_station_name_map(static_info_path: str | Path) -> dict[str, str]:
+    """Load ``station_id -> Station name`` mappings from ``static_info.csv``.
+
+    Args:
+        static_info_path: CSV exported by the static-info builder.
+
+    Returns:
+        Dict keyed by normalized station id. Returns an empty dict if the file
+        or required columns are missing.
+    """
     static_info_path = Path(static_info_path)
     if not static_info_path.exists():
         return {}
@@ -606,10 +713,16 @@ def load_station_name_map(static_info_path: str | Path) -> dict[str, str]:
 
 
 def _format_day(day: pd.Timestamp) -> str:
+    """Format a timestamp as ``YYYY-MM-DD``."""
     return day.strftime("%Y-%m-%d")
 
 
 def _parse_optional_date(value: str | pd.Timestamp | None) -> pd.Timestamp | None:
+    """Parse an optional date string or timestamp to a normalized midnight value.
+
+    Raises:
+        ValueError: If a non-null value cannot be parsed as a date.
+    """
     if value is None:
         return None
     if isinstance(value, pd.Timestamp):
@@ -625,6 +738,11 @@ def filter_by_date_bounds(
     start_date: pd.Timestamp | None,
     end_date: pd.Timestamp | None,
 ) -> dict[str, pd.DataFrame]:
+    """Restrict each station frame to an optional inclusive date range.
+
+    Raises:
+        ValueError: If ``start_date`` is after ``end_date``.
+    """
     if start_date is None and end_date is None:
         return {station_id: df.copy() for station_id, df in data.items()}
     if start_date is not None and end_date is not None and start_date > end_date:
@@ -648,6 +766,12 @@ def compute_common_interval(
     data: dict[str, pd.DataFrame],
     station_ids: list[str],
 ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Compute the largest date interval common to all listed stations.
+
+    Returns:
+        ``(start, end)`` inclusive common interval, or ``None`` if stations
+        do not overlap.
+    """
     first_days: list[pd.Timestamp] = []
     last_days: list[pd.Timestamp] = []
 
@@ -672,6 +796,7 @@ def compute_common_interval(
 
 
 def _resolve_station_name(station_id: str, station_names: dict[str, str]) -> str:
+    """Resolve a display name from static info or fallback station metadata."""
     normalized_id = _normalize_station_id(station_id)
     if normalized_id in station_names:
         return station_names[normalized_id]
@@ -690,6 +815,7 @@ def summarize_station_dataframe(df: pd.DataFrame) -> tuple[
     tuple[pd.Timestamp, ...],
     tuple[MissingValueDetail, ...],
 ]:
+    """Summarize date coverage, missing calendar days, and missing value cells."""
     if df.empty:
         return None, None, 0, (), ()
 
@@ -725,6 +851,7 @@ def build_station_summaries(
     station_ids: list[str],
     static_info_path: str | Path = DEFAULT_STATIC_INFO_PATH,
 ) -> list[StationSummary]:
+    """Build printable coverage summaries for the requested stations."""
     station_names = load_station_name_map(static_info_path)
     summaries: list[StationSummary] = []
 
@@ -752,6 +879,7 @@ def build_station_summaries(
 
 
 def _format_date_list(dates: tuple[pd.Timestamp, ...], limit: int = MAX_MISSING_VALUE_DATES_TO_PRINT) -> str:
+    """Format a tuple of dates for console output with optional truncation."""
     if not dates:
         return "none"
     formatted = [_format_day(date) for date in dates[:limit]]
@@ -761,6 +889,7 @@ def _format_date_list(dates: tuple[pd.Timestamp, ...], limit: int = MAX_MISSING_
 
 
 def _format_missing_value_details(details: tuple[MissingValueDetail, ...]) -> list[str]:
+    """Format missing dynamic value cells grouped by column."""
     if not details:
         return ["  missing value cells: none"]
 
@@ -779,6 +908,7 @@ def print_station_summaries(
     summaries: list[StationSummary],
     common_interval: tuple[pd.Timestamp, pd.Timestamp] | None,
 ) -> None:
+    """Print station summaries and the common overlapping interval."""
     print("\nNode summary:")
     for summary in summaries:
         print(
@@ -804,12 +934,18 @@ def print_station_summaries(
 
 
 def write_output_pickle(data: dict[str, pd.DataFrame], output_path: Path) -> None:
+    """Write ``dict[str, pd.DataFrame]`` station data to a pickle file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("wb") as handle:
         pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _streamflow_column(df: pd.DataFrame) -> str:
+    """Return the streamflow column name supported by a station DataFrame.
+
+    Raises:
+        ValueError: If neither short nor long streamflow column names exist.
+    """
     if "Streamflow" in df.columns:
         return "Streamflow"
     if "Streamflow [m3/s]" in df.columns:
@@ -820,6 +956,7 @@ def _streamflow_column(df: pd.DataFrame) -> str:
 
 
 def _format_return_period_station_name(name: str) -> str:
+    """Normalize a station name for return-period text export."""
     formatted = name.strip()
     if formatted.lower().startswith("rio "):
         formatted = formatted[4:]
@@ -830,6 +967,7 @@ def _resolve_return_period_station_metadata(
     station_ids: list[str],
     station_names: dict[str, str],
 ) -> tuple[list[str], list[str]]:
+    """Build parallel catchment and display-name lists for return-period export."""
     catchments: list[str] = []
     names: list[str] = []
 
@@ -849,6 +987,7 @@ def _build_return_period_streamflow_table(
     data: dict[str, pd.DataFrame],
     station_ids: list[str],
 ) -> pd.DataFrame:
+    """Assemble a wide daily streamflow table for return-period analysis."""
     all_dates: pd.DatetimeIndex | None = None
     for station_id in station_ids:
         aligned_df = _align_dataframe(data[station_id])
@@ -872,6 +1011,7 @@ def _build_return_period_streamflow_table(
 
 
 def return_period_txt_path_from_pickle(output_pickle_path: str | Path) -> Path:
+    """Derive the default return-period text path from an output pickle location."""
     return Path(output_pickle_path).parent / DEFAULT_RETURN_PERIOD_TXT_NAME
 
 
@@ -881,6 +1021,23 @@ def write_return_period_txt(
     output_path: str | Path,
     static_info_path: str | Path = DEFAULT_STATIC_INFO_PATH,
 ) -> Path:
+    """Write the semicolon-separated return-period streamflow text file.
+
+    Output file structure:
+        Row 1: ``Time;<station_ids...>``
+        Row 2: ``station catchment;<catchment names...>``
+        Row 3: ``station name;<station names...>``
+        Remaining rows: ``YYYY-MM-DD;<streamflow values...>``
+
+    Args:
+        data: Filtered station dictionary with daily streamflow columns.
+        station_ids: Ordered station columns to export.
+        output_path: Destination ``.txt`` path.
+        static_info_path: CSV used to resolve station names and catchments.
+
+    Returns:
+        Path to the written text file.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -914,6 +1071,7 @@ def _report_input_merge_differences(
     static_log_path: Path,
     num_input_files: int,
 ) -> None:
+    """Print and optionally write merge-difference logs for multi-file inputs."""
     merge_log.print_static_differences()
 
     if num_input_files <= 1:
@@ -971,6 +1129,26 @@ def process_data(
     merge_log_path: str | Path | None = None,
     merge_static_log_path: str | Path | None = None,
 ) -> dict[str, pd.DataFrame]:
+    """Load, merge, filter, and export selected station data.
+
+    Writes both the filtered pickle and the companion return-period text file,
+    then prints station coverage summaries.
+
+    Args:
+        input_paths: One or more pickle or text station files to merge.
+        stations_or_edges: Station ids or edge tokens defining the output subset.
+        output_path: Destination pickle path.
+        station_id_override: Optional id override for a single text input.
+        static_info_path: CSV with station names for summaries and export.
+        start_date: Optional first stored day (inclusive).
+        end_date: Optional last stored day (inclusive).
+        return_period_txt_path: Optional override for the return-period txt path.
+        merge_log_path: Optional CSV path for dynamic merge differences.
+        merge_static_log_path: Optional CSV path for static merge differences.
+
+    Returns:
+        Filtered ``dict[str, pd.DataFrame]`` written to ``output_path``.
+    """
     paths = [Path(path) for path in input_paths]
     for path in paths:
         if not path.exists():
@@ -1043,6 +1221,7 @@ def process_data(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the data-processing CLI."""
     parser = argparse.ArgumentParser(
         description=(
             "Load pickle and/or semicolon-separated text station files, "
@@ -1128,6 +1307,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point for loading, filtering, and exporting station data."""
     args = _parse_args()
     input_paths = args.input if args.input is not None else DEFAULT_INPUT_PATHS
     stations_or_edges = (

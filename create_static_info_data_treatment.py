@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Build and export static catchment metadata for hydrological stations.
+
+Reads station time-series pickles and raw SAIH text/CSV headers to assemble
+a ``static_info.csv`` file with catchment descriptors, names, and coordinates.
+"""
+
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -44,6 +50,15 @@ OUTPUT_COLUMNS = [
 
 @dataclass(frozen=True)
 class FallbackStationInfo:
+	"""Manual metadata for stations missing from raw SAIH header files.
+
+	Attributes:
+		name: Human-readable station name.
+		zone: UTM zone used with ``easting`` and ``northing``.
+		easting: UTM easting coordinate in metres.
+		northing: UTM northing coordinate in metres.
+		elevation: Optional gauge elevation in metres above sea level.
+	"""
 	name: str
 	zone: int
 	easting: float
@@ -120,6 +135,14 @@ DEFAULT_FALLBACK_STATIONS: dict[str, FallbackStationInfo] = {
 
 @dataclass
 class StationHeaderInfo:
+	"""Location and naming metadata parsed from a raw SAIH station file header.
+
+	Attributes:
+		station_id: Three-digit station identifier.
+		latitude: Decimal latitude in degrees, if present in the header.
+		longitude: Decimal longitude in degrees, if present in the header.
+		name: Station name string, if present in the header.
+	"""
 	station_id: str
 	latitude: float | None
 	longitude: float | None
@@ -127,6 +150,14 @@ class StationHeaderInfo:
 
 
 def _parse_station_id_from_filename(path: Path) -> str | None:
+	"""Extract a three-digit station id from a raw data filename.
+
+	Args:
+		path: Path to a raw SAIH ``.txt`` or ``.csv`` file.
+
+	Returns:
+		Last three digits of the first four-digit number in the stem, or ``None``.
+	"""
 	match = re.search(r"(\d{4})", path.stem)
 	if not match:
 		return None
@@ -134,6 +165,14 @@ def _parse_station_id_from_filename(path: Path) -> str | None:
 
 
 def _normalize_station_id(value: str) -> str:
+	"""Normalize a station id to a zero-padded three-character string.
+
+	Args:
+		value: Raw station id, optionally prefixed with ``A``.
+
+	Returns:
+		Uppercase three-digit station code (e.g. ``"018"``).
+	"""
 	value = value.strip().upper()
 	if value.startswith("A"):
 		value = value[1:]
@@ -141,18 +180,42 @@ def _normalize_station_id(value: str) -> str:
 
 
 def _iter_data_files(raw_data_folder: Path) -> Iterable[Path]:
+	"""Yield all ``.csv`` and ``.txt`` files under a raw data directory tree.
+
+	Args:
+		raw_data_folder: Root folder containing SAIH station export files.
+
+	Yields:
+		Paths to individual raw data files.
+	"""
 	for path in raw_data_folder.rglob("*"):
 		if path.is_file() and path.suffix.lower() in {".csv", ".txt"}:
 			yield path
 
 
 def _parse_header_value(line: str) -> str | None:
+	"""Return the value after the first colon in a header line.
+
+	Args:
+		line: Single line from a SAIH station file header.
+
+	Returns:
+		Stripped value to the right of ``:``, or ``None`` if no colon is present.
+	"""
 	if ":" not in line:
 		return None
 	return line.split(":", 1)[1].strip()
 
 
 def _parse_float(value: str | None) -> float | None:
+	"""Parse a European-style decimal string to float.
+
+	Args:
+		value: Numeric string, optionally using comma as decimal separator.
+
+	Returns:
+		Parsed float, or ``None`` if the value is empty or not numeric.
+	"""
 	if not value:
 		return None
 	try:
@@ -162,6 +225,18 @@ def _parse_float(value: str | None) -> float | None:
 
 
 def _utm_to_latlon(zone: int, easting: float, northing: float) -> tuple[float, float]:
+	"""Convert WGS84 UTM coordinates to latitude and longitude.
+
+	Assumes the northern hemisphere.
+
+	Args:
+		zone: UTM zone number (e.g. 30 for Spain).
+		easting: UTM easting in metres.
+		northing: UTM northing in metres.
+
+	Returns:
+		Tuple ``(latitude, longitude)`` in decimal degrees.
+	"""
 	# WGS84 UTM to lat/lon conversion (northern hemisphere).
 	a = 6378137.0
 	ecc_squared = 0.00669438
@@ -211,6 +286,15 @@ def _utm_to_latlon(zone: int, easting: float, northing: float) -> tuple[float, f
 
 
 def _parse_station_header(path: Path, station_id: str) -> StationHeaderInfo:
+	"""Parse name and coordinates from the header of a raw SAIH station file.
+
+	Args:
+		path: Path to the semicolon-separated station export file.
+		station_id: Normalized station identifier associated with the file.
+
+	Returns:
+		``StationHeaderInfo`` with any fields found before the data table.
+	"""
 	latitude = None
 	longitude = None
 	name = None
@@ -246,6 +330,16 @@ def _parse_station_header(path: Path, station_id: str) -> StationHeaderInfo:
 
 
 def _extract_static_values(df: pd.DataFrame) -> dict[str, Any]:
+	"""Extract time-invariant catchment attributes from the first data row.
+
+	Args:
+		df: Station DataFrame indexed by date with static columns repeated
+			on every row.
+
+	Returns:
+		Dict keyed by ``OUTPUT_COLUMNS`` static names with scalar values from
+		the first row, or ``None`` for missing columns when the frame is empty.
+	"""
 	if df.empty:
 		return {key: None for key in STATIC_COLUMNS.keys()}
 	first_row = df.iloc[0]
@@ -261,6 +355,28 @@ def build_static_info_csv(
 	output_csv_path: str | Path | None = None,
 	fallback_stations: dict[str, FallbackStationInfo] | None = None,
 ) -> pd.DataFrame:
+	"""Merge pickle static columns with raw header metadata and write CSV.
+
+	Input pickle structure:
+		``dict[str, pd.DataFrame]`` keyed by station id. Each DataFrame should
+		contain the static columns mapped in ``STATIC_COLUMNS``.
+
+	Output CSV structure:
+		Indexed by ``station_id`` with columns in ``OUTPUT_COLUMNS``:
+		station name, catchment area, elevation, land-cover percentages,
+		latitude, and longitude.
+
+	Args:
+		raw_data_folder: Folder tree with SAIH ``.txt``/``.csv`` station exports.
+		pickle_path: Pickle with per-station DataFrames including static fields.
+		output_csv_path: Destination CSV path. Defaults to
+			``raw_data_folder / "static_info.csv"``.
+		fallback_stations: Optional map of station ids to manual coordinates
+			and names used when raw headers are incomplete.
+
+	Returns:
+		Assembled static-info DataFrame written to ``output_csv_path``.
+	"""
 	raw_data_folder = Path(raw_data_folder)
 	pickle_path = Path(pickle_path)
 	if output_csv_path is None:
@@ -359,6 +475,7 @@ def build_static_info_csv(
 
 
 def main() -> None:
+	"""Build the default static-info CSV from configured pickle and raw paths."""
 	build_static_info_csv(
 		raw_data_folder=DEFAULT_RAW_DATA_FOLDER,
 		pickle_path=DEFAULT_PICKLE_PATH,

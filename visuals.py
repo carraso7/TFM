@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""Visualization utilities for streamflow prediction evaluation and graph maps.
+
+Provides error metrics (MSE, NSE, RMSE, nRMSE, KGE), time-series plots,
+return-period nRMSE comparisons against Conchi baselines, and Bokeh graph maps
+colored by station-level performance.
+
+Input data structures:
+    station_frames: ``dict[station_id, DataFrame]`` with columns ``date``,
+        ``observed``, and ``predicted``.
+    static_info CSV: ``station_id``, ``Station name``, ``Latitude``,
+        ``Longitude``, and optional catchment/land-cover columns.
+    weighted_adj_matrix: Square ``DataFrame`` indexed by station ID (meters).
+    Conchi NSE CSV: Semicolon-separated; row 1 scenarios, row 2 models, then
+        station rows with ``ID`` column.
+    Return-period thresholds CSV: ``station_id`` plus columns ``0.5``, ``1``,
+        ``2``, ``5``, ``10`` (streamflow lower bounds).
+    Conchi return-period nRMSE CSV: ``station_id``, ``model``, ``source_file``,
+        and columns ``T0.5`` … ``T10``.
+"""
 from __future__ import annotations
 
 import math
@@ -32,7 +51,7 @@ from adj_matrix_visualize_maps_GNNs import export_graph_for_qgis
 OBSERVED_LINE_COLOR = "#000000"
 PREDICTED_LINE_COLOR = "#2b9f9f"
 PREDICTION_LINE_WIDTH = 1.25
-FONTSIZE_DEFAULT = 15
+FONTSIZE_DEFAULT = 19
 
 WEIGHTED_ADJ_BOXPLOT_LABELS = {
     "dense": "comp.",
@@ -98,6 +117,17 @@ MAP_SEPARATED_LEGEND_DEFAULT = True
 
 
 def _validate_error_metric(error_metric: str) -> ErrorMetric:
+    """Normalize and validate an error metric name.
+
+    Args:
+        error_metric: Case-insensitive metric name (MSE, NSE, RMSE, nRMSE, KGE).
+
+    Returns:
+        Canonical metric literal.
+
+    Raises:
+        ValueError: If the metric is not supported.
+    """
     canonical_metrics = {
         "mse": "MSE",
         "nse": "NSE",
@@ -112,6 +142,15 @@ def _validate_error_metric(error_metric: str) -> ErrorMetric:
 
 
 def compute_mse(observed: np.ndarray | list[float], predicted: np.ndarray | list[float]) -> float:
+    """Compute mean squared error on finite value pairs.
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values (same shape as ``observed``).
+
+    Returns:
+        MSE, or ``nan`` when no finite pairs remain.
+    """
     observed_arr, predicted_arr = _paired_finite_arrays(observed, predicted)
     if observed_arr.size == 0:
         return float("nan")
@@ -119,6 +158,15 @@ def compute_mse(observed: np.ndarray | list[float], predicted: np.ndarray | list
 
 
 def compute_nse(observed: np.ndarray | list[float], predicted: np.ndarray | list[float]) -> float:
+    """Compute Nash–Sutcliffe efficiency on finite value pairs.
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+
+    Returns:
+        NSE in ``(-inf, 1]``, or ``nan`` when undefined.
+    """
     observed_arr, predicted_arr = _paired_finite_arrays(observed, predicted)
     if observed_arr.size == 0:
         return float("nan")
@@ -129,6 +177,15 @@ def compute_nse(observed: np.ndarray | list[float], predicted: np.ndarray | list
 
 
 def compute_rmse(observed: np.ndarray | list[float], predicted: np.ndarray | list[float]) -> float:
+    """Compute root mean squared error on finite value pairs.
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+
+    Returns:
+        RMSE, or ``nan`` when no finite pairs remain.
+    """
     observed_arr, predicted_arr = _paired_finite_arrays(observed, predicted)
     if observed_arr.size == 0:
         return float("nan")
@@ -136,6 +193,15 @@ def compute_rmse(observed: np.ndarray | list[float], predicted: np.ndarray | lis
 
 
 def compute_nrmse(observed: np.ndarray | list[float], predicted: np.ndarray | list[float]) -> float:
+    """Compute normalized RMSE (RMSE divided by mean observed flow).
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+
+    Returns:
+        nRMSE, or ``nan`` when mean observed flow is zero or no finite pairs.
+    """
     observed_arr, predicted_arr = _paired_finite_arrays(observed, predicted)
     if observed_arr.size == 0:
         return float("nan")
@@ -149,8 +215,15 @@ def compute_kge_components(
     observed: np.ndarray | list[float],
     predicted: np.ndarray | list[float],
 ) -> tuple[float, float, float]:
-    """
-    Return Pearson r, alpha (sigma_s / sigma_o), and beta (mu_s / mu_o) for KGE.
+    """Return Pearson r, alpha, and beta components for KGE.
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+
+    Returns:
+        Tuple ``(r, alpha, beta)`` where alpha is ``sigma_s / sigma_o`` and
+        beta is ``mu_s / mu_o``. Returns ``(nan, nan, nan)`` when undefined.
     """
     observed_arr, predicted_arr = _paired_finite_arrays(observed, predicted)
     if observed_arr.size < 2:
@@ -171,13 +244,16 @@ def compute_kge_components(
 
 
 def compute_kge(observed: np.ndarray | list[float], predicted: np.ndarray | list[float]) -> float:
-    """
-    Kling-Gupta efficiency (KGE).
+    """Compute Kling–Gupta efficiency (KGE).
 
-    KGE = 1 - sqrt((r - 1)^2 + (alpha - 1)^2 + (beta - 1)^2)
+    KGE = 1 - sqrt((r - 1)^2 + (alpha - 1)^2 + (beta - 1)^2).
 
-    where r is the Pearson correlation, alpha = sigma_s / sigma_o,
-    and beta = mu_s / mu_o.
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+
+    Returns:
+        KGE value, or ``nan`` when components are undefined.
     """
     r, alpha, beta = compute_kge_components(observed, predicted)
     if not all(np.isfinite(value) for value in (r, alpha, beta)):
@@ -192,6 +268,18 @@ def _paired_finite_arrays(
     observed: np.ndarray | list[float],
     predicted: np.ndarray | list[float],
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Align observed and predicted arrays and drop non-finite pairs.
+
+    Args:
+        observed: Observed values.
+        predicted: Predicted values (must match ``observed`` shape).
+
+    Returns:
+        Tuple of filtered 1-D float64 arrays.
+
+    Raises:
+        ValueError: If input shapes differ.
+    """
     observed_arr = np.asarray(observed, dtype=np.float64)
     predicted_arr = np.asarray(predicted, dtype=np.float64)
     if observed_arr.shape != predicted_arr.shape:
@@ -205,6 +293,16 @@ def compute_station_error(
     predicted: np.ndarray | list[float],
     error_metric: str = "NSE",
 ) -> float:
+    """Compute a single error metric for one station time series.
+
+    Args:
+        observed: Observed streamflow values.
+        predicted: Predicted streamflow values.
+        error_metric: One of MSE, NSE, RMSE, nRMSE, or KGE.
+
+    Returns:
+        Scalar metric value (may be ``nan``).
+    """
     metric = _validate_error_metric(error_metric)
     if metric == "MSE":
         return compute_mse(observed, predicted)
@@ -224,6 +322,17 @@ def compute_error_by_station_from_frames(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> dict[str, float]:
+    """Compute a metric independently for each station frame.
+
+    Args:
+        station_frames: Mapping from station ID to prediction DataFrame.
+        error_metric: Metric name passed to :func:`compute_station_error`.
+        observed_col: Column name for observed streamflow.
+        predicted_col: Column name for predicted streamflow.
+
+    Returns:
+        Dictionary mapping station ID to metric value.
+    """
     metric = _validate_error_metric(error_metric)
     return {
         station_id: compute_station_error(
@@ -241,6 +350,16 @@ def compute_kge_components_by_station_from_frames(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> dict[str, tuple[float, float, float]]:
+    """Compute KGE components for each station frame.
+
+    Args:
+        station_frames: Mapping from station ID to prediction DataFrame.
+        observed_col: Column name for observed streamflow.
+        predicted_col: Column name for predicted streamflow.
+
+    Returns:
+        Dictionary mapping station ID to ``(r, alpha, beta)`` tuples.
+    """
     return {
         station_id: compute_kge_components(
             frame[observed_col].to_numpy(dtype=np.float64),
@@ -257,6 +376,16 @@ def plot_random_year_predictions(
     seed: int = 42,
     filename_prefix: str = "prediction",
 ) -> None:
+    """Plot observed vs predicted streamflow for random station-year samples.
+
+    Args:
+        station_frames: Per-station DataFrames with ``date``, ``observed``,
+            and ``predicted`` columns.
+        num_stations: Maximum number of stations to sample.
+        visuals_dir: Optional directory for PNG output.
+        seed: Random seed for station and year selection.
+        filename_prefix: Prefix for saved PNG filenames.
+    """
     if not station_frames:
         print("No stations available for plotting.")
         return
@@ -310,6 +439,17 @@ def plot_random_year_predictions(
 
 
 def load_station_name_map(static_info_path: str | Path) -> dict[str, str]:
+    """Load a station ID to display name mapping from static info CSV.
+
+    Args:
+        static_info_path: CSV with ``station_id`` and ``Station name`` columns.
+
+    Returns:
+        Dictionary mapping station ID strings to trimmed station names.
+
+    Raises:
+        ValueError: If required columns are missing.
+    """
     static_info_df = pd.read_csv(static_info_path, dtype={"station_id": str})
     if "station_id" not in static_info_df.columns:
         static_info_df = static_info_df.reset_index()
@@ -345,7 +485,27 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
     separated_legend: bool = True,
     fontsize: float = FONTSIZE_DEFAULT,
 ) -> None:
+    """Plot observed vs predicted streamflow for test years per station.
+
+    Args:
+        station_frames: Per-station DataFrames with ``date``, ``observed``,
+            and ``predicted``.
+        test_years: Calendar years to include in plots.
+        station_ids: Optional subset of stations; defaults to all available.
+        station_names: Optional ID-to-name labels for titles.
+        output_dir: Directory for PNG and optional separated legend files.
+        filename_prefix: Base filename for each station PNG.
+        one_line: If True, one combined timeline; else one subplot per year.
+        year_range: Optional ``(min_year, max_year)`` filter on ``test_years``.
+        test_start_date: Optional lower date bound for plotted days.
+        test_end_date: Optional upper date bound for plotted days.
+        show_month_labels: Unused; year labels are always applied on x-axis.
+        show_plot: If True, display figures interactively.
+        separated_legend: Save legend as a separate PNG instead of on-figure.
+        fontsize: Font size for titles, labels, and ticks.
+    """
     def _format_station_label(station_id: str, station_names: dict[str, str] | None) -> str:
+        """Build a plot title label from station ID and optional name map."""
         if not station_names:
             return station_id
         name = station_names.get(station_id)
@@ -354,6 +514,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         return f"{station_id}: {str(name).strip().replace(' en ', ' in ')}"
 
     def _apply_axis_font_size(axis: plt.Axes) -> None:
+        """Apply the outer ``fontsize`` to axis labels, ticks, and title."""
         axis.xaxis.label.set_size(fontsize)
         axis.yaxis.label.set_size(fontsize)
         axis.tick_params(labelsize=fontsize)
@@ -366,6 +527,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         labels: list[str],
         legend_path: Path,
     ) -> None:
+        """Save legend handles to a standalone PNG file."""
         legend_fig, legend_axis = plt.subplots(figsize=(4, 0.5))
         legend_axis.axis("off")
         legend_fig.legend(
@@ -384,6 +546,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         *,
         legend_path: Path | None = None,
     ) -> None:
+        """Attach an on-axis legend or export a separated legend PNG."""
         handles, labels = axis.get_legend_handles_labels()
         if not handles:
             return
@@ -396,6 +559,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         years: list[int],
         year_range: tuple[int | None, int | None],
     ) -> list[int]:
+        """Filter year list by optional min/max bounds."""
         min_year, max_year = year_range
         filtered = years
         if min_year is not None:
@@ -404,12 +568,14 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
             filtered = [year for year in filtered if year <= max_year]
         return filtered
     def _set_xlim_to_dates(axis: plt.Axes, dates: np.ndarray) -> None:
+        """Set x-axis limits to the min/max plotted dates without margin."""
         if len(dates) == 0:
             return
         axis.set_xlim(pd.Timestamp(min(dates)), pd.Timestamp(max(dates)))
         axis.margins(x=0)
 
     def _apply_date_axis_labels(axis: plt.Axes) -> None:
+        """Format the x-axis with one tick per calendar year."""
         axis.xaxis.set_major_locator(mdates.YearLocator())
         axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
@@ -418,6 +584,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         years: np.ndarray,
         years_with_data: list[int],
     ) -> np.ndarray:
+        """Build a boolean mask for test-year days with optional date bounds."""
         mask = np.isin(years, years_with_data)
         if test_start_date is not None:
             mask &= dates >= test_start_date
@@ -431,6 +598,7 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
         targets: np.ndarray,
         preds: np.ndarray,
     ) -> None:
+        """Plot observed and predicted series with standard colors."""
         axis.plot(
             dates,
             targets,
@@ -596,6 +764,14 @@ def plot_test_years_predictions( ### TODO REVISAR VALORES SIMILARES 62 Y 80
 
 
 def _normalize_station_id_for_conchi(station_id: str) -> str: ### TODO REVISAR MÉTODO ENTERO
+    """Normalize station IDs to Conchi's three-digit zero-padded format.
+
+    Args:
+        station_id: Raw station identifier (may include leading ``A``).
+
+    Returns:
+        Uppercase three-digit zero-padded ID string.
+    """
     normalized = str(station_id).strip().upper()
     if normalized.startswith("A"):
         normalized = normalized[1:]
@@ -607,6 +783,22 @@ def _load_conchi_nse_by_station( ### TODO REVISAR MÉTODO ENTERO
     conchi_model: ConchiModel,
     conchi_scenario: ConchiScenario,
 ) -> dict[str, float]:
+    """Load Conchi NSE values for one model/scenario from a semicolon CSV.
+
+    The file layout is: scenario row, model row, then a header row and data
+    with an ``ID`` column per station.
+
+    Args:
+        conchi_nse_path: Path to ``ESTACIONES_AFORO_NSE.csv``.
+        conchi_model: Model column selector (``LSTM`` or ``MC-LSTM``).
+        conchi_scenario: Scenario column selector (``TS1``, ``TS2``, ``TS3``).
+
+    Returns:
+        Mapping from normalized station ID to NSE.
+
+    Raises:
+        ValueError: If the requested column or ``ID`` column is missing.
+    """
     path = Path(conchi_nse_path)
     with path.open(encoding="utf-8") as handle:
         scenario_row = handle.readline().strip().split(";")
@@ -641,6 +833,14 @@ def _load_conchi_nse_by_station( ### TODO REVISAR MÉTODO ENTERO
 
 
 def _red_white_blue_palette(num_colors: int = 256) -> list[str]: ### TODO REVISAR MÉTODO ENTERO
+    """Build a red–white–blue diverging hex color list.
+
+    Args:
+        num_colors: Number of palette steps.
+
+    Returns:
+        List of ``#RRGGBB`` color strings from red through white to blue.
+    """
     red = np.array([215.0, 48.0, 39.0])
     white = np.array([255.0, 255.0, 255.0])
     blue = np.array([69.0, 117.0, 180.0])
@@ -658,6 +858,15 @@ def _red_white_blue_palette(num_colors: int = 256) -> list[str]: ### TODO REVISA
 
 
 def _symmetric_diverging_bounds(values: list[float], *, minimum_span: float = 0.05) -> tuple[float, float]: ### TODO REVISAR MÉTODO ENTERO
+    """Compute symmetric color-bar bounds centered on zero.
+
+    Args:
+        values: Numeric values (non-finite entries ignored).
+        minimum_span: Minimum half-span when all values are missing.
+
+    Returns:
+        Tuple ``(-half_span, half_span)`` for diverging maps.
+    """
     finite_values = np.array([value for value in values if np.isfinite(value)], dtype=np.float64)
     if finite_values.size == 0:
         half_span = minimum_span
@@ -667,12 +876,29 @@ def _symmetric_diverging_bounds(values: list[float], *, minimum_span: float = 0.
 
 
 def _format_signed_difference(value: float | None) -> str: ### TODO REVISAR MÉTODO ENTERO
+    """Format a numeric difference with explicit sign for map labels.
+
+    Args:
+        value: Difference value, or ``None`` / non-finite.
+
+    Returns:
+        Signed three-decimal string, or ``N/A``.
+    """
     if value is None or not np.isfinite(value):
         return "N/A"
     return f"{value:+.3f}"
 
 
 def _lonlat_to_mercator(lon: float, lat: float) -> tuple[float, float]:
+    """Project WGS84 coordinates to Web Mercator meters.
+
+    Args:
+        lon: Longitude in degrees.
+        lat: Latitude in degrees.
+
+    Returns:
+        Tuple ``(x, y)`` in EPSG:3857 meters.
+    """
     r_major = 6378137.0
     x = math.radians(lon) * r_major
     lat = max(min(lat, 89.9999), -89.9999)
@@ -681,12 +907,31 @@ def _lonlat_to_mercator(lon: float, lat: float) -> tuple[float, float]:
 
 
 def _format_error_label(metric: str, value: float | None) -> str:
+    """Format a two-line map label with metric name and value.
+
+    Args:
+        metric: Metric abbreviation (e.g. ``NSE``).
+        value: Metric value, or non-finite.
+
+    Returns:
+        Two-line label string ending in ``N/A`` when value is missing.
+    """
     if value is None or not np.isfinite(value):
         return f"{metric}\nN/A"
     return f"{metric}\n{value:.2f}"
 
 
 def _format_kge_components_label(r: float, alpha: float, beta: float) -> str:
+    """Format KGE component values as a multi-line map label.
+
+    Args:
+        r: Pearson correlation component.
+        alpha: Variability ratio component.
+        beta: Bias ratio component.
+
+    Returns:
+        Three-line ``r`` / ``α`` / ``β`` label string.
+    """
     if not all(np.isfinite(value) for value in (r, alpha, beta)):
         return "r=N/A\nα=N/A\nβ=N/A"
     return f"r={r:.2f}\nα={alpha:.2f}\nβ={beta:.2f}"
@@ -697,6 +942,17 @@ def _compute_kge_component_shares(
     alpha: float,
     beta: float,
 ) -> tuple[float, float, float] | None:
+    """Compute normalized squared-error shares for KGE pie wedges.
+
+    Args:
+        r: Pearson correlation component.
+        alpha: Variability ratio component.
+        beta: Bias ratio component.
+
+    Returns:
+        Tuple of fractional shares for ``r``, ``alpha``, and ``beta`` terms,
+        or ``None`` when KGE components are invalid or total is zero.
+    """
     if not all(np.isfinite(value) for value in (r, alpha, beta)):
         return None
     r_term = (r - 1.0) ** 2
@@ -717,6 +973,17 @@ def _build_kge_pie_wedge_source(
     coord_lookup: dict[str, tuple[float, float]],
     kge_components_by_station: dict[str, tuple[float, float, float]],
 ) -> tuple[ColumnDataSource, ColumnDataSource]:
+    """Build Bokeh data sources for KGE component pie wedges and fallbacks.
+
+    Args:
+        station_ids: Station IDs in map order.
+        coord_lookup: Mercator ``(x, y)`` coordinates per station.
+        kge_components_by_station: ``(r, alpha, beta)`` tuples per station.
+
+    Returns:
+        Tuple of ``(wedge_source, gray_source)`` for colored wedges and gray
+        fallback circles when components are invalid.
+    """
     wedge_x: list[float] = []
     wedge_y: list[float] = []
     wedge_start_angle: list[float] = []
@@ -780,6 +1047,14 @@ def _apply_map_view_padding(
     *,
     padding_fraction: float = 0.12,
 ) -> None:
+    """Expand Bokeh map view ranges by a fraction of data span.
+
+    Args:
+        plot: Bokeh figure whose ``x_range`` and ``y_range`` will be updated.
+        x_coords: Node x coordinates in map units.
+        y_coords: Node y coordinates in map units.
+        padding_fraction: Fraction of span added on each side (default 0.12).
+    """
     if not x_coords or not y_coords:
         return
     x_min, x_max = min(x_coords), max(x_coords)
@@ -793,7 +1068,17 @@ def _apply_map_view_padding(
 
 
 def _format_legend_interval_slug(low: float, high: float) -> str:
+    """Build a filesystem-safe slug from a color-bar numeric interval.
+
+    Args:
+        low: Lower bound of the interval.
+        high: Upper bound of the interval.
+
+    Returns:
+        String like ``0.1_0.9`` for use in legend PNG filenames.
+    """
     def _fmt(value: float) -> str:
+        """Strip trailing zeros from a fixed-precision float string."""
         text = f"{value:.4f}".rstrip("0").rstrip(".")
         return text if text else "0"
 
@@ -805,12 +1090,30 @@ def _map_color_bar_legend_png_path(
     low: float,
     high: float,
 ) -> Path:
+    """Derive a color-bar legend PNG path from a map PNG and value range.
+
+    Args:
+        output_png: Base map PNG path.
+        low: Color mapper lower bound.
+        high: Color mapper upper bound.
+
+    Returns:
+        Path for the companion legend PNG file.
+    """
     output_png = Path(output_png)
     interval_slug = _format_legend_interval_slug(low, high)
     return output_png.parent / f"{output_png.stem}_legend_{interval_slug}.png"
 
 
 def _map_categorical_legend_png_path(output_png: str | Path) -> Path:
+    """Derive a categorical legend PNG path from a map PNG path.
+
+    Args:
+        output_png: Base map PNG path.
+
+    Returns:
+        Path for ``{stem}_legend.png`` in the same directory.
+    """
     output_png = Path(output_png)
     return output_png.parent / f"{output_png.stem}_legend.png"
 
@@ -820,6 +1123,13 @@ def _export_bokeh_color_bar_png(
     title: str,
     output_path: str | Path,
 ) -> None:
+    """Export a standalone Bokeh color-bar legend PNG.
+
+    Args:
+        color_mapper: Bokeh linear color mapper used on the main map.
+        title: Legend title text.
+        output_path: Destination PNG path.
+    """
     legend_plot = figure(
         width=140,
         height=320,
@@ -844,6 +1154,13 @@ def _export_bokeh_categorical_legend_png(
     *,
     orientation: str = "horizontal",
 ) -> None:
+    """Export a matplotlib categorical legend PNG for map overlays.
+
+    Args:
+        items: Sequence of ``(label, color)`` legend entries.
+        output_path: Destination PNG path.
+        orientation: ``horizontal`` or ``vertical`` legend layout.
+    """
     from matplotlib.lines import Line2D
 
     if not items:
@@ -890,6 +1207,15 @@ def _add_map_color_bar(
     label_standoff: int = 8,
     separated_legend: bool = MAP_SEPARATED_LEGEND_DEFAULT,
 ) -> None:
+    """Attach an inline Bokeh color bar unless separated legend mode is enabled.
+
+    Args:
+        plot: Bokeh figure to decorate.
+        color_mapper: Linear color mapper for the bar.
+        title: Color-bar title.
+        label_standoff: Pixel offset between bar and labels.
+        separated_legend: When True, skip adding the bar to the figure.
+    """
     if separated_legend:
         return
     color_bar = ColorBar(
@@ -905,6 +1231,16 @@ def _resolve_qgis_output_dir(
     output_html: str | Path | None,
     folder_name: str,
 ) -> Path | None:
+    """Resolve QGIS export directory from explicit path or HTML output location.
+
+    Args:
+        output_qgis_dir: Explicit export directory, if provided.
+        output_html: Map HTML path used to infer ``for_QGIS/{folder_name}``.
+        folder_name: Subfolder name under the inferred QGIS parent.
+
+    Returns:
+        Resolved directory path, or ``None`` when neither input is set.
+    """
     if output_qgis_dir is not None:
         return Path(output_qgis_dir)
     if output_html is not None:
@@ -919,6 +1255,18 @@ def _build_kge_qgis_node_attributes(
     beta_values: list[float],
     kge_values: list[float],
 ) -> dict[str, dict[str, object]]:
+    """Build per-station attribute records for KGE QGIS node export.
+
+    Args:
+        station_ids: Station IDs in export order.
+        r_values: Pearson r per station.
+        alpha_values: Alpha component per station.
+        beta_values: Beta component per station.
+        kge_values: Computed KGE per station.
+
+    Returns:
+        Nested dict suitable for ``node_extra_attributes`` in GeoPackage export.
+    """
     node_extra_attributes: dict[str, dict[str, object]] = {}
     for index, station_id in enumerate(station_ids):
         r_value = r_values[index]
@@ -954,6 +1302,21 @@ def _export_map_graph_for_qgis(
     weighted_adj_matrix: pd.DataFrame,
     node_extra_attributes: dict[str, dict[str, object]],
 ) -> Path | None:
+    """Export a metric-colored graph to QGIS via :func:`export_graph_for_qgis`.
+
+    Args:
+        output_qgis_dir: Explicit QGIS output directory.
+        output_html: HTML map path for inferring default QGIS folder.
+        folder_name: Subfolder under ``for_QGIS`` when inferring path.
+        gpkg_name: GeoPackage filename.
+        static_info_path: Station metadata CSV path.
+        station_ids: Station IDs to export.
+        weighted_adj_matrix: Edge weight matrix for the graph layer.
+        node_extra_attributes: Extra columns merged into node features.
+
+    Returns:
+        Path to the written GeoPackage, or ``None`` if no output dir resolved.
+    """
     qgis_dir = _resolve_qgis_output_dir(output_qgis_dir, output_html, folder_name)
     if qgis_dir is None:
         return None
@@ -968,6 +1331,12 @@ def _export_map_graph_for_qgis(
 
 
 def _save_bokeh_html(plot, output_html: str | Path) -> None:
+    """Save a Bokeh figure as a standalone inline-resource HTML file.
+
+    Args:
+        plot: Bokeh figure or layout to save.
+        output_html: Destination ``.html`` path (parent dirs are created).
+    """
     from bokeh.io import save
     from bokeh.resources import INLINE
 
@@ -977,6 +1346,12 @@ def _save_bokeh_html(plot, output_html: str | Path) -> None:
 
 
 def _export_bokeh_png(plot, output_png: str | Path) -> None:
+    """Export a Bokeh figure to PNG, printing a warning on failure.
+
+    Args:
+        plot: Bokeh figure to export.
+        output_png: Destination PNG path (parent dirs are created).
+    """
     try:
         from bokeh.io import export_png
 
@@ -993,6 +1368,16 @@ def _build_directed_edges(
     *,
     arrow_offset: float = 2000.0,
 ) -> tuple[ColumnDataSource, list[float], list[float], list[float], list[float]]:
+    """Build Bokeh edge segment data for a weighted directed graph.
+
+    Args:
+        weighted_adj_matrix: Square weight matrix; zeros mean no edge.
+        coord_lookup: Mercator coordinates per station ID.
+        arrow_offset: Meters to inset segment endpoints from node centers.
+
+    Returns:
+        Tuple of ``(edges_source, starts_x, starts_y, ends_x, ends_y)``.
+    """
     edge_starts_x: list[float] = []
     edge_starts_y: list[float] = []
     edge_ends_x: list[float] = []
@@ -1060,6 +1445,15 @@ def _add_graph_arrows(
     edge_ends_x: list[float],
     edge_ends_y: list[float],
 ) -> None:
+    """Add directed arrow glyphs for each graph edge segment.
+
+    Args:
+        plot: Bokeh figure receiving arrow layout items.
+        edge_starts_x: Edge start x coordinates.
+        edge_starts_y: Edge start y coordinates.
+        edge_ends_x: Edge end x coordinates.
+        edge_ends_y: Edge end y coordinates.
+    """
     for x0, y0, x1, y1 in zip(edge_starts_x, edge_starts_y, edge_ends_x, edge_ends_y):
         plot.add_layout(
             Arrow(
@@ -1088,6 +1482,25 @@ def plot_graph_error_map(
     show_plot: bool = False,
     separated_legend: bool = MAP_SEPARATED_LEGEND_DEFAULT,
 ) -> None:
+    """Render a basemap graph with nodes colored by a per-station error metric.
+
+    Args:
+        weighted_adj_matrix: Square edge-weight matrix indexed by station ID.
+        static_info_path: CSV with station coordinates and catchment metadata.
+        error_by_station: Mapping from station ID to metric value.
+        error_metric: MSE, NSE, RMSE, nRMSE, or KGE.
+        output_html: Optional standalone Bokeh HTML output path.
+        output_png: Optional static PNG export path.
+        output_qgis_dir: Optional GeoPackage export directory.
+        show_errors: Annotate nodes with formatted metric labels.
+        show_edge_km: Annotate edges with distance in kilometers.
+        show_plot: Open the interactive plot in a browser.
+        separated_legend: Export color-bar legend PNG separately from map PNG.
+
+    Raises:
+        TypeError: If ``weighted_adj_matrix`` is not a DataFrame.
+        ValueError: If matrix dimensions mismatch or station metadata is invalid.
+    """
     metric = _validate_error_metric(error_metric)
     if not isinstance(weighted_adj_matrix, pd.DataFrame):
         raise TypeError("weighted_adj_matrix must be a pandas DataFrame")
@@ -1342,9 +1755,30 @@ def plot_KGE_separated_map(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> None:
-    """
-    Plot a station graph map where each node is a pie chart of KGE component
-    contributions from r, alpha, and beta.
+    """Plot a station graph map with KGE component pie charts at each node.
+
+    Each node is split into wedges proportional to the squared deviations of
+    r, alpha, and beta from their ideal values of 1.
+
+    Args:
+        weighted_adj_matrix: Square edge-weight matrix indexed by station ID.
+        static_info_path: CSV with station coordinates and metadata.
+        station_frames: Optional prediction frames to derive KGE components.
+        kge_components_by_station: Precomputed ``(r, alpha, beta)`` per station.
+        output_html: Optional Bokeh HTML output path.
+        output_png: Optional PNG export path.
+        output_qgis_dir: Optional GeoPackage export directory.
+        show_edge_km: Annotate edges with distance labels.
+        show_plot: Open the interactive plot in a browser.
+        separated_legend: Export categorical legend PNG separately.
+        observed_col: Observed column when computing from ``station_frames``.
+        predicted_col: Predicted column when computing from ``station_frames``.
+
+    Raises:
+        ValueError: If neither ``station_frames`` nor
+            ``kge_components_by_station`` is provided.
+        TypeError: If ``weighted_adj_matrix`` is not a DataFrame.
+        ValueError: If matrix dimensions mismatch or station metadata is invalid.
     """
     if station_frames is None and kge_components_by_station is None:
         raise ValueError("Provide station_frames or kge_components_by_station")
@@ -1699,11 +2133,36 @@ def comparison_NSE_conchi( ###  TODO TODO TODO REVISAR MÉTODO ENTERO
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> dict[str, float | None]:
-    """
-    Compare model NSE against Conchi's published NSE values on a graph map.
+    """Compare model NSE against Conchi baselines on an interactive graph map.
 
-    Node color encodes model NSE minus Conchi NSE (blue = model better, red = Conchi
-    better, white = equal). Stations missing from Conchi's data are shown in gray.
+    Node color encodes model NSE minus Conchi NSE (blue = model better, red =
+    Conchi better, white = equal). Stations missing from Conchi data are gray.
+
+    Args:
+        weighted_adj_matrix: Square edge-weight matrix indexed by station ID.
+        static_info_path: CSV with station coordinates and metadata.
+        station_frames: Optional frames to compute model NSE per station.
+        nse_by_station: Precomputed model NSE values per station.
+        conchi_nse_path: Path to Conchi ``ESTACIONES_AFORO_NSE.csv``.
+        conchi_model: Conchi model column (``LSTM`` or ``MC-LSTM``).
+        conchi_scenario: Conchi scenario column (``TS1``, ``TS2``, ``TS3``).
+        output_html: Optional Bokeh HTML output path.
+        output_png: Optional PNG export path.
+        output_qgis_dir: Optional GeoPackage export directory.
+        show_edge_km: Annotate edges with distance labels.
+        show_plot: Open the interactive plot in a browser.
+        separated_legend: Export legends as separate PNG files.
+        observed_col: Observed column when computing from ``station_frames``.
+        predicted_col: Predicted column when computing from ``station_frames``.
+
+    Returns:
+        Mapping from station ID to NSE difference (model minus Conchi), or
+        ``None`` when Conchi data is unavailable for that station.
+
+    Raises:
+        ValueError: If neither ``station_frames`` nor ``nse_by_station`` is
+            provided, or station metadata is invalid.
+        TypeError: If ``weighted_adj_matrix`` is not a DataFrame.
     """
     if station_frames is None and nse_by_station is None:
         raise ValueError("Provide station_frames or nse_by_station")
@@ -2024,6 +2483,14 @@ def comparison_NSE_conchi( ###  TODO TODO TODO REVISAR MÉTODO ENTERO
 
 ### TODO INIT REVISAR CHAT
 def _format_return_period_label(return_period: float) -> str:
+    """Format a return period as a short axis label (e.g. ``T2``).
+
+    Args:
+        return_period: Return period in years.
+
+    Returns:
+        Label string from :data:`RETURN_PERIOD_LABELS` or ``T{value}``.
+    """
     label = RETURN_PERIOD_LABELS.get(return_period)
     if label is None:
         label = RETURN_PERIOD_LABELS.get(float(return_period))
@@ -2033,6 +2500,14 @@ def _format_return_period_label(return_period: float) -> str:
 
 
 def _format_return_period_axis_label(return_period: float) -> str:
+    """Format a return period as a LaTeX mathtext axis label.
+
+    Args:
+        return_period: Return period in years.
+
+    Returns:
+        Matplotlib mathtext string like ``$T_{2}$``.
+    """
     return rf"$T_{{{return_period:g}}}$"
 
 
@@ -2041,6 +2516,15 @@ def _return_period_model_order(
     *,
     include_mc_lstm: bool = True,
 ) -> list[str]:
+    """Return model names in display order for return-period plots.
+
+    Args:
+        gnn_model_label: Label used for the GNN model series.
+        include_mc_lstm: Whether to append ``MC-LSTM`` after ``LSTM``.
+
+    Returns:
+        Ordered list of model display names.
+    """
     model_order = [gnn_model_label, "LSTM"]
     if include_mc_lstm:
         model_order.append("MC-LSTM")
@@ -2048,6 +2532,12 @@ def _return_period_model_order(
 
 
 def _apply_axis_font_size(axis: plt.Axes, fontsize: float) -> None:
+    """Apply a font size to axis labels, tick labels, and title.
+
+    Args:
+        axis: Matplotlib axes to style.
+        fontsize: Target font size in points.
+    """
     axis.xaxis.label.set_size(fontsize)
     axis.yaxis.label.set_size(fontsize)
     axis.tick_params(labelsize=fontsize)
@@ -2063,6 +2553,14 @@ def _save_separated_figure_legend(
     fontsize: float = FONTSIZE_DEFAULT,
     ncol: int | None = None,
 ) -> None:
+    """Save matplotlib legend handles to a standalone PNG file.
+
+    Args:
+        handles: Legend artist handles.
+        legend_path: Destination PNG path.
+        fontsize: Legend font size.
+        ncol: Number of legend columns; defaults to number of labels.
+    """
     labels = [handle.get_label() for handle in handles]
     if not labels:
         return
@@ -2083,11 +2581,20 @@ def _save_separated_figure_legend(
 def _load_return_period_thresholds_lookup(
     return_periods_path: str | Path,
 ) -> dict[str, dict[float, float]]:
-    """
-    Load per-station streamflow lower bounds for each return period.
+    """Load per-station streamflow lower bounds for each return period.
 
-    The CSV is expected to contain `station_id` plus one column per return period
-    (for example `0.5`, `1`, `2`, `5`, `10`).
+    The CSV is expected to contain ``station_id`` plus one column per return
+    period (for example ``0.5``, ``1``, ``2``, ``5``, ``10``).
+
+    Args:
+        return_periods_path: Path to ``summary_return_periods.csv``.
+
+    Returns:
+        Nested dict ``station_id -> {return_period: threshold}`` with
+        normalized station IDs.
+
+    Raises:
+        ValueError: If ``station_id`` column is missing.
     """
     path = Path(return_periods_path)
     thresholds_df = pd.read_csv(path, dtype={"station_id": str})
@@ -2118,6 +2625,15 @@ def _get_station_return_period_thresholds(
     thresholds_lookup: dict[str, dict[float, float]],
     station_id: str,
 ) -> dict[str, float]:
+    """Look up return-period thresholds for one station.
+
+    Args:
+        thresholds_lookup: Output of :func:`_load_return_period_thresholds_lookup`.
+        station_id: Station ID (normalized internally for lookup).
+
+    Returns:
+        Mapping from return period to threshold, or empty dict if unknown.
+    """
     return thresholds_lookup.get(_normalize_station_id_for_conchi(station_id), {})
 
 
@@ -2125,6 +2641,15 @@ def _get_return_period_threshold(
     thresholds: dict[float, float],
     return_period: float,
 ) -> float | None:
+    """Return the streamflow threshold for one return period.
+
+    Args:
+        thresholds: Return-period to threshold mapping for one station.
+        return_period: Target return period in years.
+
+    Returns:
+        Threshold value, or ``None`` if not found or non-finite.
+    """
     target_period = float(return_period)
     direct_value = thresholds.get(target_period)
     if direct_value is not None and np.isfinite(direct_value):
@@ -2140,6 +2665,16 @@ def _describe_return_period_event_bin(
     analysis_return_periods: list[float],
     thresholds: dict[float, float],
 ) -> str:
+    """Describe the observed-streamflow bin for one return period.
+
+    Args:
+        return_period: Return period being described.
+        analysis_return_periods: Ordered list of periods in the analysis.
+        thresholds: Per-period lower-bound thresholds for the station.
+
+    Returns:
+        Human-readable description of the event bin or a missing-data message.
+    """
     analysis_sorted = sorted(float(period) for period in analysis_return_periods)
     normalized_return_period = float(return_period)
     period_label = _format_return_period_label(normalized_return_period)
@@ -2178,7 +2713,17 @@ def _mask_observed_for_return_period(
     analysis_return_periods: list[float],
     thresholds: dict[float, float],
 ) -> np.ndarray:
-    """Build an event mask using observed streamflow only."""
+    """Build a boolean event mask using observed streamflow only.
+
+    Args:
+        observed: Observed streamflow array.
+        return_period: Return period defining the event bin.
+        analysis_return_periods: Ordered periods used for bin edges.
+        thresholds: Lower-bound thresholds per return period.
+
+    Returns:
+        Boolean mask aligned with ``observed`` selecting event days.
+    """
     analysis_sorted = sorted(float(period) for period in analysis_return_periods)
     normalized_return_period = float(return_period)
     if normalized_return_period not in analysis_sorted:
@@ -2217,14 +2762,29 @@ def _compute_gnn_nrmse_for_return_period(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> tuple[float, str | None]:
-    """
-    Compute GNN nRMSE for one station and return period.
+    """Compute GNN nRMSE for one station and return period.
 
-    Event-day selection uses observed streamflow only. Predictions are evaluated
-    on those same days when computing nRMSE.
+    Event-day selection uses observed streamflow only. Predictions are
+    evaluated on those same days when computing nRMSE.
 
-    When examine_train_test is True (default), peaks are evaluated over the full
-    time series. When False, only days on or after test_start_date are used.
+    When ``examine_train_test`` is True (default), peaks are evaluated over the
+    full time series. When False, only days on or after ``test_start_date`` are
+    used.
+
+    Args:
+        frame: Station prediction DataFrame with ``date``, ``observed``, and
+            ``predicted`` columns.
+        return_period: Return period defining the peak-flow event bin.
+        analysis_return_periods: Ordered periods for bin edge logic.
+        station_thresholds: Lower-bound thresholds for this station.
+        test_start_date: First test day when ``examine_train_test`` is False.
+        examine_train_test: Include train-period days in event selection.
+        observed_col: Observed streamflow column name.
+        predicted_col: Predicted streamflow column name.
+
+    Returns:
+        Tuple of ``(nrmse_value, missing_reason)``; ``missing_reason`` is
+        ``None`` on success.
     """
     period_label = _format_return_period_label(return_period)
     day_scope = "train+test" if examine_train_test else "test"
@@ -2315,6 +2875,15 @@ def _report_missing_gnn_return_period_points(
     *,
     gnn_model_label: str,
 ) -> None:
+    """Print warnings for GNN return-period nRMSE points that could not be computed.
+
+    Args:
+        station_ids: Stations included in the analysis.
+        return_periods: Return periods evaluated.
+        gnn_values: Nested ``return_period -> station_id -> nRMSE``.
+        missing_reasons: Parallel structure of human-readable failure reasons.
+        gnn_model_label: Model label printed in the warning header.
+    """
     print(f"\nGNN return-period nRMSE warnings ({gnn_model_label}):")
     reported_any = False
     for station_id in station_ids:
@@ -2338,6 +2907,16 @@ def _lookup_gnn_nrmse_value(
     return_period: float,
     station_id: str,
 ) -> float | None:
+    """Look up a finite GNN nRMSE value for one station and return period.
+
+    Args:
+        gnn_values: Nested ``return_period -> station_id -> nRMSE``.
+        return_period: Target return period in years.
+        station_id: Station identifier.
+
+    Returns:
+        nRMSE value, or ``None`` if missing or non-finite.
+    """
     period_key = float(return_period)
     station_values = gnn_values.get(period_key)
     if station_values is None:
@@ -2358,6 +2937,16 @@ def _conchi_source_file_matches_training_scenario(
     model_prefix: str,
     training_scenario: str,
 ) -> bool:
+    """Check whether a Conchi result file matches a training scenario prefix.
+
+    Args:
+        source_file: ``source_file`` column value from Conchi results CSV.
+        model_prefix: Lowercase model prefix (``lstm`` or ``mclstm``).
+        training_scenario: Scenario token such as ``C2`` or ``TS1``.
+
+    Returns:
+        True when ``source_file`` starts with ``{model_prefix}-{scenario}-``.
+    """
     if source_file is None or pd.isna(source_file):
         return False
     expected_prefix = f"{model_prefix}-{training_scenario}-"
@@ -2365,6 +2954,14 @@ def _conchi_source_file_matches_training_scenario(
 
 
 def _conchi_model_prefix_to_display_name(model_prefix: str) -> str | None:
+    """Map Conchi CSV model prefix to a plot display name.
+
+    Args:
+        model_prefix: Raw ``model`` column value from Conchi CSV.
+
+    Returns:
+        ``LSTM``, ``MC-LSTM``, or ``None`` if unrecognized.
+    """
     normalized = model_prefix.strip().lower()
     if normalized == "lstm":
         return "LSTM"
@@ -2378,6 +2975,18 @@ def _load_conchi_nrmse_lookup(
     *,
     training_scenario: ConchiTrainingScenario = "C2",
 ) -> dict[str, dict[str, dict[float, float]]]:
+    """Load Conchi return-period nRMSE values filtered by training scenario.
+
+    Args:
+        conchi_nrmse_path: Path to ``selected_conchi_results_ret_periods.csv``.
+        training_scenario: Scenario token matched against ``source_file`` prefix.
+
+    Returns:
+        Nested dict ``station_id -> model_name -> {return_period: nRMSE}``.
+
+    Raises:
+        ValueError: If required CSV columns are missing.
+    """
     path = Path(conchi_nrmse_path)
     conchi_df = pd.read_csv(path, dtype={"station_id": str})
     required_columns = {"station_id", "model", "source_file", *RETURN_PERIOD_VALUE_TO_COLUMN.values()}
@@ -2416,6 +3025,17 @@ def _lookup_conchi_nrmse(
     model_name: str,
     return_period: float,
 ) -> float | None:
+    """Look up a finite Conchi nRMSE for one station, model, and return period.
+
+    Args:
+        lookup: Output of :func:`_load_conchi_nrmse_lookup`.
+        station_id: Station identifier (normalized internally).
+        model_name: Display model name (``LSTM`` or ``MC-LSTM``).
+        return_period: Return period in years.
+
+    Returns:
+        nRMSE value, or ``None`` if missing or non-finite.
+    """
     station_values = lookup.get(_normalize_station_id_for_conchi(station_id))
     if station_values is None:
         return None
@@ -2434,6 +3054,16 @@ def _format_return_period_station_tick(
     *,
     show_only_station_id: bool = DEFAULT_RETURN_PERIOD_LINEPLOT_SHOW_ONLY_STATION_ID,
 ) -> str:
+    """Format a station label for return-period subplot titles.
+
+    Args:
+        station_id: Station identifier.
+        station_names: Optional ID-to-name mapping.
+        show_only_station_id: When True, omit the station name from the label.
+
+    Returns:
+        Tick/title label string.
+    """
     if show_only_station_id:
         return f"Station {station_id}"
     if not station_names:
@@ -2445,6 +3075,11 @@ def _format_return_period_station_tick(
 
 
 def _ensure_return_period_model_color(gnn_model_label: str) -> None:
+    """Ensure a color exists in :data:`RETURN_PERIOD_MODEL_COLORS` for a model.
+
+    Args:
+        gnn_model_label: GNN model display name; copies GNN-LSTM color if new.
+    """
     if gnn_model_label not in RETURN_PERIOD_MODEL_COLORS:
         RETURN_PERIOD_MODEL_COLORS[gnn_model_label] = RETURN_PERIOD_MODEL_COLORS["GNN-LSTM"]
 
@@ -2453,6 +3088,15 @@ def _stations_with_conchi_nrmse_data(
     station_ids: list[str],
     conchi_lookup: dict[str, dict[str, dict[float, float]]],
 ) -> list[str]:
+    """Filter stations that appear in the Conchi return-period lookup.
+
+    Args:
+        station_ids: Candidate station IDs.
+        conchi_lookup: Conchi nRMSE lookup table.
+
+    Returns:
+        Subset of ``station_ids`` present in ``conchi_lookup``.
+    """
     return [
         station_id
         for station_id in station_ids
@@ -2475,6 +3119,26 @@ def _collect_return_period_nrmse_values(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> tuple[dict[float, dict[str, float]], dict[str, dict[str, dict[float, float]]]]:
+    """Compute GNN and load Conchi return-period nRMSE values for plotting.
+
+    Args:
+        station_frames: Per-station prediction DataFrames.
+        station_ids: Stations to evaluate.
+        return_periods: Return periods in years.
+        return_periods_path: CSV with event-bin thresholds per station.
+        test_start_date: Optional first test day when not examining train+test.
+        examine_train_test: Include train days in event selection.
+        conchi_nrmse_path: Conchi return-period results CSV path.
+        training_scenario: Conchi training scenario filter.
+        gnn_model_label: Label for GNN series in warnings.
+        report_missing_points: Print reasons for missing GNN values.
+        observed_col: Observed streamflow column name.
+        predicted_col: Predicted streamflow column name.
+
+    Returns:
+        Tuple of ``(gnn_values, conchi_lookup)`` where ``gnn_values`` maps
+        return period to station nRMSE and ``conchi_lookup`` holds Conchi data.
+    """
     thresholds_lookup = _load_return_period_thresholds_lookup(return_periods_path)
     conchi_lookup = _load_conchi_nrmse_lookup(
         conchi_nrmse_path,
@@ -2537,6 +3201,26 @@ def collect_return_period_nrmse_values(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> tuple[dict[float, dict[str, float]], dict[str, dict[str, dict[float, float]]]]:
+    """Public wrapper to collect GNN and Conchi return-period nRMSE values.
+
+    Args:
+        station_frames: Per-station prediction DataFrames.
+        station_ids: Stations to evaluate.
+        return_periods: Return periods; defaults to :data:`DEFAULT_RETURN_PERIODS`.
+        return_periods_path: Event-threshold CSV path.
+        test_start_date: Optional test start date string or timestamp.
+        examine_train_test: Include train days in peak event selection.
+        conchi_nrmse_path: Conchi return-period nRMSE CSV path.
+        training_scenario: Conchi training scenario filter.
+        gnn_model_label: Display label for the GNN model series.
+        report_missing_points: Print missing-value diagnostics.
+        observed_col: Observed streamflow column name.
+        predicted_col: Predicted streamflow column name.
+
+    Returns:
+        Tuple of GNN nRMSE values and Conchi lookup (see
+        :func:`_collect_return_period_nrmse_values`).
+    """
     if return_periods is None:
         return_periods = list(DEFAULT_RETURN_PERIODS)
     test_start = pd.Timestamp(test_start_date) if test_start_date is not None else None
@@ -2564,6 +3248,19 @@ def _model_values_for_return_period(
     gnn_values: dict[float, dict[str, float]],
     conchi_lookup: dict[str, dict[str, dict[float, float]]],
 ) -> list[float]:
+    """Collect finite nRMSE values for one model at one return period.
+
+    Args:
+        model_name: Model display name to extract.
+        gnn_model_label: GNN label used in ``gnn_values``.
+        return_period: Return period in years.
+        station_ids: Stations to include.
+        gnn_values: GNN nRMSE lookup by period and station.
+        conchi_lookup: Conchi nRMSE lookup table.
+
+    Returns:
+        List of finite nRMSE values across stations for the model.
+    """
     values: list[float] = []
     for station_id in station_ids:
         if model_name == gnn_model_label:
@@ -2587,6 +3284,15 @@ def _return_period_model_legend_handles(
     *,
     include_mc_lstm: bool = True,
 ) -> list[plt.Artist]:
+    """Build matplotlib line handles for return-period model legend.
+
+    Args:
+        gnn_model_label: GNN model display name.
+        include_mc_lstm: Whether to include an MC-LSTM handle.
+
+    Returns:
+        List of :class:`matplotlib.lines.Line2D` legend artists.
+    """
     model_order = _return_period_model_order(
         gnn_model_label,
         include_mc_lstm=include_mc_lstm,
@@ -2612,6 +3318,19 @@ def _draw_return_period_boxplot(
     gnn_values: dict[float, dict[str, float]],
     conchi_lookup: dict[str, dict[str, dict[float, float]]],
 ) -> list[plt.Artist]:
+    """Draw grouped boxplots of nRMSE by return period and model on one axis.
+
+    Args:
+        ax: Matplotlib axes to draw on.
+        return_periods: Return periods in years (x-axis groups).
+        station_ids: Stations whose values populate each box.
+        gnn_model_label: GNN model display name.
+        gnn_values: GNN nRMSE lookup by period and station.
+        conchi_lookup: Conchi nRMSE lookup table.
+
+    Returns:
+        Legend handles for the three model series.
+    """
     model_order = [gnn_model_label, "LSTM", "MC-LSTM"]
     box_width = 0.18
     period_positions = np.arange(len(return_periods), dtype=np.float64)
@@ -2673,6 +3392,20 @@ def _compute_return_period_nrmse_ylim(
     include_mc_lstm: bool = True,
     padding: float = 0.05,
 ) -> tuple[float, float]:
+    """Compute shared y-axis limits for return-period nRMSE line plots.
+
+    Args:
+        station_ids: Stations included in the y-limit calculation.
+        return_periods: Return periods evaluated.
+        gnn_model_label: GNN model display name.
+        gnn_values: GNN nRMSE lookup by period and station.
+        conchi_lookup: Conchi nRMSE lookup table.
+        include_mc_lstm: Include MC-LSTM values in the max calculation.
+        padding: Fractional margin added above the maximum value.
+
+    Returns:
+        Tuple ``(0.0, ymax + margin)`` suitable for ``ax.set_ylim``.
+    """
     model_order = _return_period_model_order(
         gnn_model_label,
         include_mc_lstm=include_mc_lstm,
@@ -2714,6 +3447,25 @@ def _draw_return_period_lineplot(
     include_mc_lstm: bool = False,
     show_only_station_id: bool = DEFAULT_RETURN_PERIOD_LINEPLOT_SHOW_ONLY_STATION_ID,
 ) -> list[plt.Artist]:
+    """Draw return-period nRMSE line charts on one or more subplot axes.
+
+    Args:
+        axes: Array of matplotlib axes (one panel per station).
+        station_ids: Stations to plot, in panel order.
+        return_periods: Return periods on the x-axis.
+        gnn_model_label: GNN model display name.
+        gnn_values: GNN nRMSE lookup by period and station.
+        conchi_lookup: Conchi nRMSE lookup table.
+        station_names: Optional ID-to-name mapping for titles.
+        ylim: Shared y-axis limits for all panels.
+        grid_cols: Column count for y-label and x-label placement logic.
+        fontsize: Font size for labels and titles.
+        include_mc_lstm: Whether to plot MC-LSTM series.
+        show_only_station_id: Omit station names from subplot titles.
+
+    Returns:
+        Legend handles for plotted model series.
+    """
     model_order = _return_period_model_order(
         gnn_model_label,
         include_mc_lstm=include_mc_lstm,
@@ -2802,9 +3554,25 @@ def plot_return_period_nrmse_boxplots(
     observed_col: str = "observed",
     predicted_col: str = "predicted",
 ) -> None:
-    """
-    Plot one boxplot figure where each return period groups nRMSE values across
-    stations for GNN-LSTM, LSTM, and MC-LSTM.
+    """Plot return-period nRMSE boxplots comparing GNN, LSTM, and MC-LSTM.
+
+    Each x-axis group is one return period; boxes aggregate values across
+    stations for each model.
+
+    Args:
+        station_frames: Per-station prediction DataFrames.
+        station_ids: Stations to include.
+        gnn_model_label: Display label for the GNN model.
+        return_periods: Return periods; defaults to :data:`DEFAULT_RETURN_PERIODS`.
+        return_periods_path: Event-threshold CSV path.
+        test_start_date: Optional test start date filter.
+        examine_train_test: Include train days in peak event selection.
+        conchi_nrmse_path: Conchi return-period nRMSE CSV path.
+        training_scenario: Conchi training scenario filter.
+        output_path: Optional PNG output path.
+        show_plot: Display the figure interactively.
+        observed_col: Observed streamflow column name.
+        predicted_col: Predicted streamflow column name.
     """
     if not station_ids:
         print("No stations provided for return-period nRMSE boxplots.")
@@ -2887,14 +3655,37 @@ def plot_return_period_nrmse_lineplots(
     fontsize: float = FONTSIZE_DEFAULT,
     include_mc_lstm: bool = False,
 ) -> None:
-    """
-    Plot return-period nRMSE line charts in a station grid (2 rows x 2 columns by
-    default). Each panel shows how nRMSE evolves across return periods for
-    GNN-LSTM and LSTM (and optionally MC-LSTM). All panels share the same y-axis limits.
+    """Plot return-period nRMSE line charts in a station grid.
 
-    When output_path is set, individual station PNGs are also saved under
+    Each panel shows how nRMSE evolves across return periods for GNN-LSTM and
+    LSTM (and optionally MC-LSTM). All panels share the same y-axis limits.
+
+    When ``output_path`` is set, individual station PNGs are also saved under
     ``lineplot_return_periods/`` next to the combined figure unless
-    individual_output_dir is provided explicitly.
+    ``individual_output_dir`` is provided explicitly.
+
+    Args:
+        station_frames: Per-station prediction DataFrames.
+        station_ids: Stations to plot (one subplot each, up to grid size).
+        gnn_model_label: Display label for the GNN model.
+        return_periods: Return periods; defaults to :data:`DEFAULT_RETURN_PERIODS`.
+        return_periods_path: Event-threshold CSV path.
+        test_start_date: Optional test start date filter.
+        examine_train_test: Include train days in peak event selection.
+        station_names: Optional ID-to-name mapping for titles.
+        conchi_nrmse_path: Conchi return-period nRMSE CSV path.
+        training_scenario: Conchi training scenario filter.
+        output_path: Combined grid figure PNG path.
+        individual_output_dir: Directory for per-station PNG exports.
+        show_plot: Display figures interactively.
+        observed_col: Observed streamflow column name.
+        predicted_col: Predicted streamflow column name.
+        grid_rows: Number of subplot rows.
+        grid_cols: Number of subplot columns.
+        show_only_station_id: Omit station names from subplot titles.
+        separated_legend: Save legend as a separate PNG file.
+        fontsize: Font size for labels and titles.
+        include_mc_lstm: Plot MC-LSTM series in addition to LSTM.
     """
     if not station_ids:
         print("No stations provided for return-period nRMSE lineplots.")
@@ -3041,6 +3832,14 @@ def plot_return_period_nrmse_lineplots(
 
 
 def _finite_station_metric_values(values_by_station: dict[str, float]) -> list[float]:
+    """Extract finite metric values from a per-station mapping.
+
+    Args:
+        values_by_station: Mapping from station ID to metric value.
+
+    Returns:
+        List of finite float values (non-finite and ``None`` entries skipped).
+    """
     return [
         float(value)
         for value in values_by_station.values()
@@ -3054,6 +3853,17 @@ def compute_station_metric_boxplot_ylim(
     padding: float = 0.05,
     ymin: float | None = None,
 ) -> tuple[float, float]:
+    """Compute shared y-axis limits for station metric comparison boxplots.
+
+    Args:
+        metric_by_param_label_groups: One dict per panel, each mapping param
+            label to ``station_id -> metric`` values.
+        padding: Fractional margin below/above data range.
+        ymin: Optional fixed lower y-limit; when set, only upper margin varies.
+
+    Returns:
+        Tuple ``(lower, upper)`` suitable for ``ax.set_ylim``.
+    """
     all_values: list[float] = []
     for group in metric_by_param_label_groups:
         for values_by_station in group.values():
@@ -3083,6 +3893,16 @@ def _format_station_metric_param_tick_label(
     *,
     format_labels: bool,
 ) -> str:
+    """Format an x-axis tick label for a varied hyperparameter value.
+
+    Args:
+        label: Raw parameter value label.
+        varied_param: Name of the varied parameter (e.g. ``weighted_adj``).
+        format_labels: Apply friendly replacements and underscore-to-space.
+
+    Returns:
+        Display string for boxplot x-axis ticks.
+    """
     if varied_param == "weighted_adj":
         return WEIGHTED_ADJ_BOXPLOT_LABELS.get(label, label)
     if format_labels:
@@ -3107,6 +3927,27 @@ def _draw_station_metric_boxplot_on_axis(
     show_outliers_as_dots: bool = False,
     show_title: bool = True,
 ) -> bool:
+    """Draw one boxplot panel comparing a metric across parameter values.
+
+    Args:
+        ax: Matplotlib axes to draw on.
+        metric_by_param_label: Maps parameter label to ``station_id -> metric``.
+        error_metric: Y-axis metric name (e.g. ``NSE``).
+        varied_param: Name of the hyperparameter on the x-axis.
+        baseline_label: Parameter label highlighted as baseline.
+        highlight_baseline: Color the baseline box differently.
+        baseline_color: Face color for the baseline box.
+        default_color: Face color for non-baseline boxes.
+        ylim: Optional shared y-axis limits.
+        show_ylabel: Whether to draw the y-axis label.
+        format_labels: Apply friendly tick-label formatting.
+        fontsize: Font size for labels and title.
+        show_outliers_as_dots: Show fliers; when False whiskers span full range.
+        show_title: Whether to draw the panel title.
+
+    Returns:
+        True when at least one box was drawn, else False.
+    """
     if not metric_by_param_label:
         return False
 
@@ -3174,11 +4015,25 @@ def plot_station_metric_boxplot_by_param_values(
     fontsize: float = FONTSIZE_DEFAULT,
     show_outliers_as_dots: bool = False,
 ) -> None:
-    """
-    Draw one boxplot per parameter value showing the chosen metric across stations.
+    """Draw one boxplot comparing a metric across hyperparameter values.
 
-    metric_by_param_label maps a human-readable parameter value label to
-    station_id -> metric value.
+    ``metric_by_param_label`` maps a human-readable parameter value label to
+    ``station_id -> metric value``.
+
+    Args:
+        metric_by_param_label: Nested mapping as described above.
+        error_metric: Metric name for the y-axis (default ``NSE``).
+        varied_param: Hyperparameter name for the x-axis label.
+        output_path: Optional PNG output path.
+        show_plot: Display the figure interactively.
+        baseline_label: Parameter value highlighted as baseline.
+        highlight_baseline: Color the baseline box differently.
+        baseline_color: Face color for the baseline box.
+        default_color: Face color for other boxes.
+        ylim: Optional y-axis limits.
+        format_labels: Apply friendly tick-label formatting.
+        fontsize: Font size for labels and title.
+        show_outliers_as_dots: Show outlier markers on boxes.
     """
     if not metric_by_param_label:
         print("No parameter values provided for comparison boxplot.")
@@ -3234,7 +4089,25 @@ def plot_station_metric_boxplot_grid(
     show_outliers_as_dots: bool = False,
     show_titles: bool = False,
 ) -> None:
-    """Draw a grid of boxplots, one panel per varied parameter, sharing a y-axis."""
+    """Draw a grid of boxplots, one panel per varied parameter.
+
+    Args:
+        metric_by_varied_param: Maps varied parameter name to
+            ``param_label -> {station_id: metric}`` nested dicts.
+        error_metric: Metric name for the shared y-axis.
+        baseline_labels: Optional baseline label per varied parameter.
+        output_path: Optional PNG output path for the full grid figure.
+        show_plot: Display the figure interactively.
+        highlight_baseline: Color baseline boxes differently per panel.
+        baseline_color: Face color for baseline boxes.
+        default_color: Face color for non-baseline boxes.
+        ylim: Shared y-axis limits; computed automatically when ``None``.
+        format_labels: Apply friendly tick-label formatting.
+        rows: Number of grid rows.
+        fontsize: Font size for labels and titles.
+        show_outliers_as_dots: Show outlier markers on boxes.
+        show_titles: Draw a title on each panel.
+    """
     varied_params = [param for param, values in metric_by_varied_param.items() if values]
     if not varied_params:
         print("No parameter groups provided for comparison boxplot grid.")
@@ -3319,6 +4192,17 @@ def plot_graph_mse_map(
     output_html: str | Path | None = None,
     show_plot: bool = False,
 ) -> None:
+    """Render a graph map with nodes colored by per-station MSE.
+
+    Thin wrapper around :func:`plot_graph_error_map` with ``error_metric="MSE"``.
+
+    Args:
+        weighted_adj_matrix: Square edge-weight matrix indexed by station ID.
+        static_info_path: CSV with station coordinates and metadata.
+        mse_by_station: Mapping from station ID to MSE value.
+        output_html: Optional Bokeh HTML output path.
+        show_plot: Open the interactive plot in a browser.
+    """
     plot_graph_error_map(
         weighted_adj_matrix,
         static_info_path,

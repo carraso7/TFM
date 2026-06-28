@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Temporal GNN-LSTM streamflow prediction: training, evaluation, and visualization.
+
+Loads multi-station time series from a pickle file, builds river-network adjacency
+matrices, trains dual- or mono-encoder graph models, and writes checkpoints plus plots.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -65,6 +70,7 @@ DEFAULT_ADJ_NORMALIZATION = "inv_dist"
 DEFAULT_PICKLE_PATH = "/mnt/d/streamflow_prediction/inputs_selected_stations.pkl"
 DEFAULT_VISUALS_DIR = "/mnt/d/streamflow_prediction/visuals"
 DEFAULT_MODEL_DIR = "/mnt/d/streamflow_prediction/models"
+DEFAULT_BASELINE_MODEL_NAME = "baseline_model"
 WINDOW_DAYS = 1460 # 365
 BATCH_SIZE = 16 # 32
 EPOCHS = 60 # 30 # 120 # 60 # 30
@@ -124,6 +130,16 @@ TARGET_COLUMN = "Streamflow"
 
 
 def _normalize_adj_row_norm(adj: torch.Tensor, self_loops: bool = SELF_LOOPS, undirected: bool = UNDIRECTED_GRAPH) -> torch.Tensor:
+    """Row-normalise an adjacency matrix for message passing.
+
+    Args:
+        adj: Square adjacency tensor ``(num_nodes, num_nodes)`` with edge weights.
+        self_loops: If True, set diagonal entries to 1 before normalisation.
+        undirected: If True, symmetrise the matrix with element-wise maximum.
+
+    Returns:
+        Row-normalised adjacency tensor of the same shape as ``adj``.
+    """
     adj = adj.T.clone() # Transpose the adjacency matrix to make it column-wise and so that neighbours are upstream gauging stations.
     if undirected:
         adj = torch.maximum(adj, adj.T)  # Get bidirectional adjacency matrix.
@@ -135,7 +151,17 @@ def _normalize_adj_row_norm(adj: torch.Tensor, self_loops: bool = SELF_LOOPS, un
 
 
 def _normalize_adj_inv_dist(adj: torch.Tensor, self_loops: bool = SELF_LOOPS, undirected: bool = UNDIRECTED_GRAPH) -> torch.Tensor:
-    """Add self-loops if self_loops is True and convert non-zero edge weights to inverse distance (1/value)."""
+    """Convert edge weights to inverse distance without row normalisation.
+
+    Args:
+        adj: Square adjacency tensor ``(num_nodes, num_nodes)``; non-zero values are
+            treated as distances and replaced by ``1 / value``.
+        self_loops: If True, set diagonal entries to 1 before inversion.
+        undirected: If True, symmetrise the matrix with element-wise maximum.
+
+    Returns:
+        Adjacency tensor of the same shape with inverse-distance weights.
+    """
     adj = adj.T.clone() # Transpose the adjacency matrix to make it column-wise and so that neighbours are upstream gauging stations.
     if undirected:
         adj = torch.maximum(adj, adj.T)  # Get bidirectional adjacency matrix.
@@ -190,12 +216,35 @@ TemporalModel = nn.Module
 
 
 def _validate_aggregation(aggregation: str) -> str:
+    """Validate neighbour-aggregation mode for message passing.
+
+    Args:
+        aggregation: One of ``"sum"``, ``"max"``, or ``"mean"``.
+
+    Returns:
+        The validated aggregation string unchanged.
+
+    Raises:
+        ValueError: If ``aggregation`` is not supported.
+    """
     if aggregation not in VALID_AGGREGATIONS:
         raise ValueError(f"aggregation must be one of {VALID_AGGREGATIONS}, got {aggregation!r}")
     return aggregation
 
 
 def _resolve_weighted_adj_fn(name_or_alias: str | None) -> Callable[..., pd.DataFrame]:
+    """Resolve a weighted adjacency builder by function name or alias.
+
+    Args:
+        name_or_alias: Registry key such as ``"river_dist"`` or full function name,
+            or ``None`` for the default builder.
+
+    Returns:
+        Callable that returns a station-by-station ``pd.DataFrame`` adjacency matrix.
+
+    Raises:
+        ValueError: If the name or alias is unknown.
+    """
     if name_or_alias is None:
         return DEFAULT_WEIGHTED_ADJ_FN
     if name_or_alias in WEIGHTED_ADJ_FN_BY_ALIAS:
@@ -206,6 +255,18 @@ def _resolve_weighted_adj_fn(name_or_alias: str | None) -> Callable[..., pd.Data
 
 
 def _validate_model_type(model_type: str) -> str:
+    """Validate encoder layout identifier.
+
+    Args:
+        model_type: ``"dual"`` (separate LSTM and static encoders) or ``"mono"``
+            (static features concatenated into the LSTM input).
+
+    Returns:
+        Lower-case validated model type.
+
+    Raises:
+        ValueError: If ``model_type`` is not supported.
+    """
     resolved = model_type.strip().lower()
     if resolved not in VALID_MODEL_TYPES:
         raise ValueError(f"model_type must be one of {VALID_MODEL_TYPES}, got {model_type!r}")
@@ -213,6 +274,17 @@ def _validate_model_type(model_type: str) -> str:
 
 
 def _validate_adj_normalization(adj_normalization: str) -> str:
+    """Validate adjacency normalisation strategy name.
+
+    Args:
+        adj_normalization: ``"row_norm"`` or ``"inv_dist"``.
+
+    Returns:
+        Lower-case validated normalisation name.
+
+    Raises:
+        ValueError: If ``adj_normalization`` is not supported.
+    """
     resolved = adj_normalization.strip().lower()
     if resolved not in VALID_ADJ_NORMALIZATIONS:
         raise ValueError(
@@ -227,6 +299,16 @@ def _make_normalize_adj_fn(
     self_loops: bool = SELF_LOOPS,
     undirected: bool = UNDIRECTED_GRAPH,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a partial adjacency normaliser bound to graph options.
+
+    Args:
+        adj_normalization: ``"row_norm"`` or ``"inv_dist"``.
+        self_loops: Passed through to the underlying normaliser.
+        undirected: Passed through to the underlying normaliser.
+
+    Returns:
+        Callable accepting ``adj`` ``(N, N)`` and returning a normalised tensor.
+    """
     base_fn = _ADJ_NORMALIZATION_FNS[_validate_adj_normalization(adj_normalization)]
 
     def normalize(adj: torch.Tensor) -> torch.Tensor:
@@ -237,6 +319,14 @@ def _make_normalize_adj_fn(
 
 
 def is_mono_model_type(model_type: str) -> bool:
+    """Return whether the model type uses the mono (LSTM-only) encoder layout.
+
+    Args:
+        model_type: ``"dual"`` or ``"mono"``.
+
+    Returns:
+        ``True`` when ``model_type`` is ``"mono"``.
+    """
     return _validate_model_type(model_type) == "mono"
 
 
@@ -245,6 +335,16 @@ def _aggregate_neighbors(
     h: torch.Tensor,
     aggregation: str,
 ) -> torch.Tensor:
+    """Aggregate neighbour node embeddings according to the adjacency matrix.
+
+    Args:
+        adj: Normalised adjacency ``(num_nodes, num_nodes)``.
+        h: Node hidden states ``(batch, num_nodes, hidden_dim)``.
+        aggregation: Neighbour reduction mode: ``"sum"``, ``"max"``, or ``"mean"``.
+
+    Returns:
+        Aggregated neighbour messages with shape ``(batch, num_nodes, hidden_dim)``.
+    """
     aggregation = _validate_aggregation(aggregation)
     if aggregation == "sum":
         # H[b]^(l+1) = H[b]^(l) + ReLU(A_hat @ H[b]^(l))
@@ -267,7 +367,7 @@ def _aggregate_neighbors(
 
 
 class MessagePassingStack(nn.Module):
-    """Neighbour aggregation with optional learnable linear map and residual update."""
+    """Stack of graph message-passing steps with optional learnable layers."""
 
     def __init__(
         self,
@@ -276,6 +376,14 @@ class MessagePassingStack(nn.Module):
         aggregation: str = AGGREGATION,
         train_message_passing: bool = TRAIN_MESSAGE_PASSING,
     ) -> None:
+        """Initialise message-passing layers.
+
+        Args:
+            hidden_dim: Hidden size of node embeddings.
+            message_passes: Number of neighbour-aggregation steps.
+            aggregation: Neighbour reduction mode (``"sum"``, ``"max"``, or ``"mean"``).
+            train_message_passing: If True, apply a linear map and residual after each pass.
+        """
         super().__init__()
         self.message_passes = message_passes
         self.aggregation = _validate_aggregation(aggregation)
@@ -288,6 +396,15 @@ class MessagePassingStack(nn.Module):
             self.layers = nn.ModuleList()
 
     def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """Run message passing over the graph.
+
+        Args:
+            h: Node embeddings ``(batch, num_nodes, hidden_dim)``.
+            adj: Normalised adjacency ``(num_nodes, num_nodes)``.
+
+        Returns:
+            Updated node embeddings with the same shape as ``h``.
+        """
         if self.train_message_passing:
             for layer in self.layers:
                 messages = _aggregate_neighbors(adj, h, self.aggregation)
@@ -299,6 +416,11 @@ class MessagePassingStack(nn.Module):
 
 
 def set_random_seed(seed: int) -> None:
+    """Set random seeds for PyTorch, NumPy, and the standard library.
+
+    Args:
+        seed: Integer seed applied to all three RNG backends.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -308,6 +430,17 @@ set_random_seed(SEED)
 
 
 def _validate_training_metric(metric: str) -> str:
+    """Validate and canonicalise the training loss metric name.
+
+    Args:
+        metric: ``"MSE"`` or ``"RMSE"`` (case-insensitive).
+
+    Returns:
+        Upper-case metric name.
+
+    Raises:
+        ValueError: If ``metric`` is not supported.
+    """
     canonical_metrics = {
         "mse": "MSE",
         "rmse": "RMSE",
@@ -319,6 +452,14 @@ def _validate_training_metric(metric: str) -> str:
 
 
 def _resolve_saved_training_metric(metric: str) -> str:
+    """Resolve a metric from saved metadata, falling back to the default on error.
+
+    Args:
+        metric: Metric string read from a checkpoint JSON file.
+
+    Returns:
+        Validated metric name, or ``TRAINING_METRIC`` if validation fails.
+    """
     try:
         return _validate_training_metric(metric)
     except ValueError:
@@ -326,13 +467,27 @@ def _resolve_saved_training_metric(metric: str) -> str:
 
 
 class TrainingMetricLoss(nn.Module):
-    """Differentiable training loss for MSE and RMSE."""
+    """Differentiable scalar loss for MSE or RMSE over flattened predictions."""
 
     def __init__(self, metric: str = TRAINING_METRIC) -> None:
+        """Initialise the loss module.
+
+        Args:
+            metric: ``"MSE"`` or ``"RMSE"`` (case-insensitive).
+        """
         super().__init__()
         self.metric = _validate_training_metric(metric)
 
     def forward(self, predicted: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
+        """Compute the configured loss between predictions and observations.
+
+        Args:
+            predicted: Model output of any shape; flattened internally.
+            observed: Target values with the same shape as ``predicted``.
+
+        Returns:
+            Scalar loss tensor.
+        """
         predicted = predicted.reshape(-1)
         observed = observed.reshape(-1)
 
@@ -343,6 +498,15 @@ class TrainingMetricLoss(nn.Module):
 
 @dataclass
 class TrainConfig:
+    """Hyperparameters and file paths for a temporal GNN training run.
+
+    Attributes:
+        pickle_path: Path to the input pickle (see ``load_station_series``).
+        static_info_path: CSV/Excel with station metadata for adjacency construction.
+        model_dir: Directory for ``.pt`` checkpoints and companion ``.json`` metadata.
+        visuals_dir: Directory for evaluation plots when visualisation is enabled.
+    """
+
     epochs: int = EPOCHS
     hidden_dim: int = HIDDEN_DIM
     lr: float = LR
@@ -368,8 +532,24 @@ class TrainConfig:
     verbose: int = 2
     examine_train_test_peaks: bool = True
     run_name: str | None = None
+    relations: list[tuple[str, str]] | None = None
+
+    def resolve_relations(self) -> list[tuple[str, str]]:
+        """Return upstream-downstream station pairs for graph construction.
+
+        Returns:
+            List of ``(upstream_id, downstream_id)`` tuples; uses ``DEFAULT_RELATIONS``
+            when ``self.relations`` is ``None``.
+        """
+        return self.relations or DEFAULT_RELATIONS
 
     def normalize_adj_fn(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Return the adjacency normalisation callable for this config.
+
+        Returns:
+            Custom ``normalize_adj`` if set, otherwise a function built from
+            ``adj_normalization``, ``self_loops``, and ``undirected_graph``.
+        """
         if self.normalize_adj is not None:
             return self.normalize_adj
         return _make_normalize_adj_fn(
@@ -379,12 +559,28 @@ class TrainConfig:
         )
 
     def resolve_weighted_adj_fn(self) -> Callable[..., pd.DataFrame]:
+        """Return the weighted adjacency builder for single-branch models.
+
+        Returns:
+            Callable that produces a square ``pd.DataFrame`` indexed by station ID.
+        """
         return self.weighted_adj_fn or DEFAULT_WEIGHTED_ADJ_FN
 
     def uses_mono_encoder(self) -> bool:
+        """Return whether this config selects the mono encoder layout.
+
+        Returns:
+            ``True`` when ``model_type`` is ``"mono"``.
+        """
         return is_mono_model_type(self.model_type)
 
     def to_metadata(self) -> dict[str, Any]:
+        """Serialise config fields for JSON checkpoint sidecar files.
+
+        Returns:
+            Dictionary of JSON-serialisable hyperparameters. Callable fields
+            (``normalize_adj``, ``weighted_adj_fn``) are replaced by string names.
+        """
         data = asdict(self)
         data["pickle_path"] = str(self.pickle_path)
         data["static_info_path"] = str(self.static_info_path)
@@ -417,6 +613,17 @@ class TrainConfig:
 
 @dataclass
 class RunResult:
+    """Container for a trained model and its evaluation artefacts.
+
+    Attributes:
+        prediction_frames: Mapping ``station_id -> DataFrame`` with columns
+            ``date``, ``observed``, and ``predicted``.
+        errors_by_metric: Nested dict ``metric_name -> {station_id: error_value}``.
+        return_period_values: Return-period NRMSE summaries keyed by return period.
+        weighted_adj: Square ``pd.DataFrame`` adjacency used for the run (index/columns
+            are station IDs).
+    """
+
     config: TrainConfig
     model: nn.Module
     station_ids: list[str]
@@ -432,6 +639,15 @@ class RunResult:
 
 @dataclass
 class StationSeries:
+    """In-memory arrays for one gauging station after pickle loading.
+
+    Attributes:
+        dynamic: Daily dynamic features ``(num_days, len(DYNAMIC_COLUMNS))``.
+        target: Daily streamflow ``(num_days,)``.
+        static: Time-invariant catchment attributes ``(len(STATIC_COLUMNS),)``.
+        dates: Aligned date index ``(num_days,)`` shared across stations.
+    """
+
     station_id: str
     dynamic: np.ndarray
     target: np.ndarray
@@ -440,13 +656,29 @@ class StationSeries:
 
 
 def _iter_station_frames(data: dict) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield ``(station_id, DataFrame)`` pairs from a loaded pickle dict.
+
+    Args:
+        data: Top-level pickle object; expected to map station IDs to DataFrames.
+
+    Yields:
+        Tuples of station ID and corresponding ``pd.DataFrame`` (non-DataFrame values
+        are skipped).
+    """
     for station_id, df in data.items():
         if isinstance(df, pd.DataFrame):
             yield station_id, df
 
 
 def _clamp_streamflow_predictions(preds: torch.Tensor) -> torch.Tensor:
-    """Inference-only floor at zero; training still uses unconstrained model outputs."""
+    """Floor predicted streamflow at zero during inference only.
+
+    Args:
+        preds: Raw model outputs of any shape.
+
+    Returns:
+        Tensor of the same shape with negative values set to ``0.0``.
+    """
     return torch.clamp(preds, min=0.0)
 
 
@@ -454,13 +686,24 @@ def _broadcast_static_into_window(
     dynamic_window: np.ndarray,
     static_features: np.ndarray,
 ) -> np.ndarray:
-    """Concatenate static features to every timestep in a node's dynamic window."""
+    """Concatenate static features to every timestep in a dynamic window.
+
+    Args:
+        dynamic_window: Array ``(window_days, dynamic_dim)``.
+        static_features: Array ``(static_dim,)``.
+
+    Returns:
+        Array ``(window_days, dynamic_dim + static_dim)`` with static values tiled
+        across time.
+    """
     window_days = dynamic_window.shape[0]
     static_tiled = np.tile(static_features, (window_days, 1))
     return np.concatenate([dynamic_window, static_tiled], axis=-1)
 
 
 class GraphWindowDataset(Dataset):
+    """PyTorch dataset of sliding windows for dual-encoder TemporalGNN models."""
+
     def __init__(
         self,
         series: list[StationSeries],
@@ -468,6 +711,14 @@ class GraphWindowDataset(Dataset):
         start_idx: int,
         end_idx: int,
     ) -> None:
+        """Build indexable windows over aligned multi-station series.
+
+        Args:
+            series: One ``StationSeries`` per graph node, in consistent node order.
+            window_days: Length of each input look-back window in days.
+            start_idx: First sample index (inclusive) into the sliding-window range.
+            end_idx: Last sample index (exclusive).
+        """
         self.series = series
         self.window_days = window_days
         self.start_idx = start_idx
@@ -477,9 +728,21 @@ class GraphWindowDataset(Dataset):
         self.static_dim = series[0].static.shape[0]
 
     def __len__(self) -> int:
+        """Return the number of sliding-window samples in this split."""
         return self.end_idx - self.start_idx
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return one graph sample with separate dynamic and static tensors.
+
+        Args:
+            idx: Sample index within ``[0, len(self))``.
+
+        Returns:
+            Tuple ``(dynamic, static, targets)`` where ``dynamic`` has shape
+            ``(num_nodes, window_days, dynamic_dim)``, ``static`` has shape
+            ``(num_nodes, static_dim)``, and ``targets`` has shape ``(num_nodes,)``
+            (streamflow on the last day of each window).
+        """
         end = self.start_idx + idx + self.window_days
         start = end - self.window_days
         dynamic = np.zeros((self.num_nodes, self.window_days, self.dynamic_dim), dtype=np.float32)
@@ -493,7 +756,7 @@ class GraphWindowDataset(Dataset):
 
 
 class GraphWindowDatasetLSTMOnly(Dataset):
-    """Window dataset with static features repeated at every timestep in the LSTM input."""
+    """Sliding-window dataset with static features repeated at every timestep."""
 
     def __init__(
         self,
@@ -502,6 +765,14 @@ class GraphWindowDatasetLSTMOnly(Dataset):
         start_idx: int,
         end_idx: int,
     ) -> None:
+        """Build indexable windows for mono-encoder models.
+
+        Args:
+            series: One ``StationSeries`` per graph node, in consistent node order.
+            window_days: Length of each input look-back window in days.
+            start_idx: First sample index (inclusive).
+            end_idx: Last sample index (exclusive).
+        """
         self.series = series
         self.window_days = window_days
         self.start_idx = start_idx
@@ -512,9 +783,20 @@ class GraphWindowDatasetLSTMOnly(Dataset):
         self.input_dim = self.dynamic_dim + self.static_dim
 
     def __len__(self) -> int:
+        """Return the number of sliding-window samples in this split."""
         return self.end_idx - self.start_idx
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return one graph sample with fused dynamic+static features.
+
+        Args:
+            idx: Sample index within ``[0, len(self))``.
+
+        Returns:
+            Tuple ``(features, targets)`` where ``features`` has shape
+            ``(num_nodes, window_days, dynamic_dim + static_dim)`` and ``targets``
+            has shape ``(num_nodes,)``.
+        """
         end = self.start_idx + idx + self.window_days
         start = end - self.window_days
         features = np.zeros((self.num_nodes, self.window_days, self.input_dim), dtype=np.float32)
@@ -529,11 +811,27 @@ class GraphWindowDatasetLSTMOnly(Dataset):
 
 
 class LSTMEncoder(nn.Module):
+    """Single-layer LSTM encoder applied independently to each node's time series."""
+
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        """Initialise the per-node LSTM.
+
+        Args:
+            input_dim: Number of input features per timestep.
+            hidden_dim: LSTM hidden state size.
+        """
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode temporal windows into final hidden states per node.
+
+        Args:
+            x: Input ``(batch, num_nodes, window_days, input_dim)``.
+
+        Returns:
+            Tensor ``(batch, num_nodes, hidden_dim)`` from the last LSTM timestep.
+        """
         batch_size, num_nodes, window_days, dynamic_dim = x.shape
         x = x.reshape(batch_size * num_nodes, window_days, dynamic_dim) # We treat each node's time series as a separate sequence in the batch for nn.LSTM structure simplicity. 
         _, (h_n, _) = self.lstm(x)
@@ -542,7 +840,15 @@ class LSTMEncoder(nn.Module):
 
 
 class StaticEncoder(nn.Module):
+    """Two-layer MLP encoder for time-invariant catchment attributes."""
+
     def __init__(self, static_dim: int, hidden_dim: int) -> None:
+        """Initialise the static feature encoder.
+
+        Args:
+            static_dim: Number of static catchment attributes per node.
+            hidden_dim: Output embedding size.
+        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(static_dim, hidden_dim),
@@ -550,11 +856,27 @@ class StaticEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map static features to hidden embeddings.
+
+        Args:
+            x: Static features ``(batch, num_nodes, static_dim)``.
+
+        Returns:
+            Embeddings ``(batch, num_nodes, hidden_dim)``.
+        """
         return self.net(x)
 
 
 class MLPDecoder(nn.Module):
+    """Two-layer MLP that maps node embeddings to scalar streamflow predictions."""
+
     def __init__(self, input_dim: int, hidden_dim: int | None = None) -> None:
+        """Initialise the decoder network.
+
+        Args:
+            input_dim: Size of the input node embedding.
+            hidden_dim: Hidden layer width; defaults to ``input_dim`` when ``None``.
+        """
         super().__init__()
         hidden_dim = hidden_dim or input_dim
         self.net = nn.Sequential(
@@ -564,10 +886,20 @@ class MLPDecoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict streamflow from node embeddings.
+
+        Args:
+            x: Node embeddings ``(batch, num_nodes, input_dim)``.
+
+        Returns:
+            Predictions ``(batch, num_nodes, 1)``.
+        """
         return self.net(x)
 
 
 class TemporalGNN(nn.Module):
+    """Dual-encoder temporal GNN: LSTM + static MLP, fusion, message passing, decoder."""
+
     def __init__(
         self,
         dynamic_dim: int,
@@ -579,6 +911,18 @@ class TemporalGNN(nn.Module):
         aggregation: str = AGGREGATION,
         train_message_passing: bool = TRAIN_MESSAGE_PASSING,
     ) -> None:
+        """Build a dual-encoder graph model with one adjacency matrix.
+
+        Args:
+            dynamic_dim: Number of dynamic input features per timestep.
+            static_dim: Number of static catchment attributes per node.
+            hidden_dim: Hidden size shared across encoders and message passing.
+            message_passes: Number of graph message-passing steps.
+            adj: Raw adjacency ``(num_nodes, num_nodes)``; stored normalised as a buffer.
+            normalize_adj: Optional adjacency normaliser; defaults to inverse distance.
+            aggregation: Neighbour aggregation mode for message passing.
+            train_message_passing: Whether message-passing layers are trainable.
+        """
         super().__init__()
         self.temporal_encoder = LSTMEncoder(dynamic_dim, hidden_dim)
         self.static_encoder = StaticEncoder(static_dim, hidden_dim)
@@ -598,13 +942,24 @@ class TemporalGNN(nn.Module):
 
     @property
     def message_passes(self) -> int:
+        """Number of message-passing steps configured on the stack."""
         return self.message_passing.message_passes
 
     @property
     def aggregation(self) -> str:
+        """Neighbour aggregation mode used during message passing."""
         return self.message_passing.aggregation
 
     def forward(self, dynamic: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        """Predict next-day streamflow for every node in the batch.
+
+        Args:
+            dynamic: ``(batch, num_nodes, window_days, dynamic_dim)``.
+            static: ``(batch, num_nodes, static_dim)``.
+
+        Returns:
+            Predictions ``(batch, num_nodes)``.
+        """
         temporal_h = self.temporal_encoder(dynamic)
         static_h = self.static_encoder(static)
         h = self.fusion(torch.cat([temporal_h, static_h], dim=-1))
@@ -613,7 +968,7 @@ class TemporalGNN(nn.Module):
 
 
 class TemporalGNNLSTMOnly(nn.Module):
-    """Temporal GNN with a single LSTM encoder; static features are part of the input series."""
+    """Mono-encoder temporal GNN with static features in the LSTM input sequence."""
 
     def __init__(
         self,
@@ -625,6 +980,17 @@ class TemporalGNNLSTMOnly(nn.Module):
         aggregation: str = "sum",
         train_message_passing: bool = TRAIN_MESSAGE_PASSING,
     ) -> None:
+        """Build a mono-encoder graph model with one adjacency matrix.
+
+        Args:
+            input_dim: Fused feature size per timestep (dynamic + static).
+            hidden_dim: Hidden size for LSTM and message passing.
+            message_passes: Number of graph message-passing steps.
+            adj: Raw adjacency ``(num_nodes, num_nodes)``.
+            normalize_adj: Optional adjacency normaliser.
+            aggregation: Neighbour aggregation mode.
+            train_message_passing: Whether message-passing layers are trainable.
+        """
         super().__init__()
         self.temporal_encoder = LSTMEncoder(input_dim, hidden_dim)
         self.decoder = MLPDecoder(hidden_dim)
@@ -639,13 +1005,23 @@ class TemporalGNNLSTMOnly(nn.Module):
 
     @property
     def message_passes(self) -> int:
+        """Number of message-passing steps configured on the stack."""
         return self.message_passing.message_passes
 
     @property
     def aggregation(self) -> str:
+        """Neighbour aggregation mode used during message passing."""
         return self.message_passing.aggregation
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Predict next-day streamflow from fused temporal features.
+
+        Args:
+            features: ``(batch, num_nodes, window_days, input_dim)``.
+
+        Returns:
+            Predictions ``(batch, num_nodes)``.
+        """
         h = self.temporal_encoder(features)
         h = self.message_passing(h, self.adj)
         return self.decoder(h).squeeze(-1)
@@ -665,6 +1041,18 @@ class TemporalGNNMultiAdj(nn.Module):
         aggregation: str = AGGREGATION,
         train_message_passing: bool = TRAIN_MESSAGE_PASSING,
     ) -> None:
+        """Build a dual-encoder model with one branch per adjacency strategy.
+
+        Args:
+            dynamic_dim: Number of dynamic input features per timestep.
+            static_dim: Number of static catchment attributes per node.
+            hidden_dim: Hidden size shared across encoders and message passing.
+            message_passes: Number of graph message-passing steps per branch.
+            adjs: List of raw adjacency tensors, one per branch.
+            normalize_adj: Optional adjacency normaliser applied to each matrix.
+            aggregation: Neighbour aggregation mode.
+            train_message_passing: Whether message-passing layers are trainable.
+        """
         super().__init__()
         if not adjs:
             raise ValueError("TemporalGNNMultiAdj requires at least one adjacency matrix")
@@ -688,16 +1076,32 @@ class TemporalGNNMultiAdj(nn.Module):
 
     @property
     def message_passes(self) -> int:
+        """Number of message-passing steps configured on the stack."""
         return self.message_passing.message_passes
 
     @property
     def aggregation(self) -> str:
+        """Neighbour aggregation mode used during message passing."""
         return self.message_passing.aggregation
 
     def branch_adjs(self) -> list[torch.Tensor]:
+        """Return normalised adjacency buffers for all parallel branches.
+
+        Returns:
+            List of tensors ``adj_0``, ``adj_1``, ... registered on the module.
+        """
         return [getattr(self, f"adj_{idx}") for idx in range(self.num_branches)]
 
     def forward(self, dynamic: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        """Predict streamflow using parallel message passing over multiple adjacencies.
+
+        Args:
+            dynamic: ``(batch, num_nodes, window_days, dynamic_dim)``.
+            static: ``(batch, num_nodes, static_dim)``.
+
+        Returns:
+            Predictions ``(batch, num_nodes)``.
+        """
         temporal_h = self.temporal_encoder(dynamic)
         static_h = self.static_encoder(static)
         h = self.fusion(torch.cat([temporal_h, static_h], dim=-1))
@@ -720,6 +1124,17 @@ class TemporalGNNLSTMOnlyMultiAdj(nn.Module):
         aggregation: str = "sum",
         train_message_passing: bool = TRAIN_MESSAGE_PASSING,
     ) -> None:
+        """Build a mono-encoder model with one branch per adjacency strategy.
+
+        Args:
+            input_dim: Fused feature size per timestep (dynamic + static).
+            hidden_dim: Hidden size for LSTM and message passing.
+            message_passes: Number of graph message-passing steps per branch.
+            adjs: List of raw adjacency tensors, one per branch.
+            normalize_adj: Optional adjacency normaliser applied to each matrix.
+            aggregation: Neighbour aggregation mode.
+            train_message_passing: Whether message-passing layers are trainable.
+        """
         super().__init__()
         if not adjs:
             raise ValueError("TemporalGNNLSTMOnlyMultiAdj requires at least one adjacency matrix")
@@ -738,16 +1153,31 @@ class TemporalGNNLSTMOnlyMultiAdj(nn.Module):
 
     @property
     def message_passes(self) -> int:
+        """Number of message-passing steps configured on the stack."""
         return self.message_passing.message_passes
 
     @property
     def aggregation(self) -> str:
+        """Neighbour aggregation mode used during message passing."""
         return self.message_passing.aggregation
 
     def branch_adjs(self) -> list[torch.Tensor]:
+        """Return normalised adjacency buffers for all parallel branches.
+
+        Returns:
+            List of tensors ``adj_0``, ``adj_1``, ... registered on the module.
+        """
         return [getattr(self, f"adj_{idx}") for idx in range(self.num_branches)]
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Predict streamflow using parallel message passing over multiple adjacencies.
+
+        Args:
+            features: ``(batch, num_nodes, window_days, input_dim)``.
+
+        Returns:
+            Predictions ``(batch, num_nodes)``.
+        """
         h = self.temporal_encoder(features)
         branch_outputs = [
             self.message_passing(h, adj) for adj in self.branch_adjs()
@@ -756,6 +1186,14 @@ class TemporalGNNLSTMOnlyMultiAdj(nn.Module):
 
 
 def _is_mono_model(model: nn.Module) -> bool:
+    """Return whether the module uses the mono (LSTM-only) encoder layout.
+
+    Args:
+        model: Any ``nn.Module`` instance.
+
+    Returns:
+        ``True`` for ``TemporalGNNLSTMOnly`` and ``TemporalGNNLSTMOnlyMultiAdj``.
+    """
     return isinstance(model, (TemporalGNNLSTMOnly, TemporalGNNLSTMOnlyMultiAdj))
 
 
@@ -769,6 +1207,23 @@ def build_temporal_model(
     adj_tensors: list[torch.Tensor] | None,
     device: torch.device,
 ) -> nn.Module:
+    """Instantiate the appropriate temporal GNN architecture from config.
+
+    Args:
+        config: Training configuration selecting model type and graph options.
+        dynamic_dim: Dynamic feature count (dual encoder only).
+        static_dim: Static feature count (dual encoder only).
+        input_dim: Fused input size (mono encoder) or ``dynamic_dim + static_dim``.
+        adj_tensor: Single adjacency for non-multi-branch models, or ``None``.
+        adj_tensors: List of adjacencies when ``config.several_gnn_layers`` is True.
+        device: Target device for the constructed module.
+
+    Returns:
+        Initialised model moved to ``device``.
+
+    Raises:
+        ValueError: If required adjacency tensors are missing for the chosen layout.
+    """
     normalize_adj = config.normalize_adj_fn()
     aggregation = config.aggregation
     train_message_passing = config.train_message_passing
@@ -917,6 +1372,13 @@ def print_temporal_gnn_lstm_only_summary(
     batch_size: int = 1,
     window_days: int = 365,
 ) -> None:
+    """Print layer shapes, parameter counts, and hyperparameters for TemporalGNNLSTMOnly.
+
+    Args:
+        model: Trained or randomly initialised ``TemporalGNNLSTMOnly`` instance.
+        batch_size: Batch size used for the dummy forward pass.
+        window_days: Sequence length fed to the LSTM encoder.
+    """
     num_nodes = model.adj.shape[0]
     input_dim = model.temporal_encoder.lstm.input_size
     hidden_dim = model.temporal_encoder.lstm.hidden_size
@@ -977,6 +1439,24 @@ def load_station_series(
     pickle_path: str | Path,
     station_ids: list[str],
 ) -> list[StationSeries]:
+    """Load aligned multi-station time series from a pickle file.
+
+    The pickle must contain a mapping ``station_id -> pd.DataFrame``. Each DataFrame
+    is indexed by date and must include columns listed in ``DYNAMIC_COLUMNS``,
+    ``STATIC_COLUMNS``, and ``TARGET_COLUMN`` (streamflow). Rows with missing
+    dynamic or target values are dropped; static values are taken from the first row.
+
+    Args:
+        pickle_path: Path to the ``.pkl`` input file.
+        station_ids: Station IDs to load, in desired graph node order.
+
+    Returns:
+        List of ``StationSeries`` objects sharing a common date index.
+
+    Raises:
+        ValueError: If no matching stations, no common dates, or required columns
+            are missing.
+    """
     with Path(pickle_path).open("rb") as handle:
         data = pickle.load(handle)
 
@@ -1041,7 +1521,15 @@ def load_station_series(
 
 
 def build_short_model_path(model_dir: str | Path, run_name: str) -> Path:
-    """Return a short, deterministic checkpoint path safe for Windows path limits."""
+    """Return a short, deterministic checkpoint path safe for Windows path limits.
+
+    Args:
+        model_dir: Directory where ``.pt`` checkpoints are stored.
+        run_name: Human-readable run identifier hashed into the filename.
+
+    Returns:
+        Path ``model_dir/gnn_{16-char-sha256}.pt``.
+    """
     digest = hashlib.sha256(run_name.encode("utf-8")).hexdigest()[:16]
     return Path(model_dir) / f"gnn_{digest}.pt"
 
@@ -1051,6 +1539,24 @@ def save_temporal_gnn_run(
     config: TrainConfig,
     model_path: str | Path,
 ) -> tuple[Path, Path]:
+    """Persist model weights and JSON metadata for a training run.
+
+    Writes two sibling files:
+    - ``model_path`` (``.pt``): PyTorch ``state_dict`` only.
+    - ``model_path`` with ``.json`` suffix: serialised hyperparameters from
+      ``config.to_metadata()``, optionally including ``run_name``.
+
+    Args:
+        model: Trained module whose weights are saved.
+        config: Run configuration used to build metadata.
+        model_path: Destination path for the ``.pt`` checkpoint.
+
+    Returns:
+        Tuple ``(model_path, metadata_path)`` of written file paths.
+
+    Raises:
+        RuntimeError: If the checkpoint cannot be written (e.g. path too long).
+    """
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = model_path.with_suffix(".json")
@@ -1081,6 +1587,24 @@ def load_temporal_gnn_run(
     adj_tensors: list[torch.Tensor] | None,
     device: torch.device,
 ) -> nn.Module:
+    """Load a saved checkpoint and reconstruct the matching model architecture.
+
+    Reads optional ``.json`` metadata beside ``model_path`` to override config
+    fields, builds the model, and loads the ``state_dict`` from the ``.pt`` file.
+
+    Args:
+        model_path: Path to the ``.pt`` checkpoint.
+        config: Base configuration; may be updated from saved metadata.
+        dynamic_dim: Dynamic feature count for dual-encoder models.
+        static_dim: Static feature count for dual-encoder models.
+        input_dim: Fused input size for mono-encoder models.
+        adj_tensor: Single adjacency tensor, or ``None`` for multi-branch models.
+        adj_tensors: List of adjacency tensors for multi-branch models.
+        device: Device onto which weights are loaded.
+
+    Returns:
+        Eval-mode model with restored weights.
+    """
     model_path = Path(model_path)
     metadata_path = model_path.with_suffix(".json")
     resolved_config = config
@@ -1111,6 +1635,21 @@ def evaluate_temporal_gnn_run(
     test_loader: DataLoader,
     weighted_adj: pd.DataFrame,
 ) -> RunResult:
+    """Evaluate a trained model and assemble result artefacts.
+
+    Args:
+        model: Trained temporal GNN in eval mode.
+        config: Run configuration (window size, peak handling, etc.).
+        series: Loaded ``StationSeries`` for all graph nodes.
+        station_ids: Station IDs in graph node order.
+        split_idx: Train/test split index in sliding-window sample space.
+        test_loader: DataLoader over the held-out test windows.
+        weighted_adj: Square adjacency ``DataFrame`` (index/columns = station IDs).
+
+    Returns:
+        ``RunResult`` with prediction frames, per-metric node errors, and
+        return-period NRMSE summaries.
+    """
     test_start_idx = split_idx + config.window_days - 1
     prediction_frames = build_prediction_frames(model, series, config.window_days)
     errors_by_metric = {
@@ -1142,20 +1681,40 @@ def evaluate_temporal_gnn_run(
     )
 
 
-def _build_weighted_adj_matrices(config: TrainConfig) -> tuple[pd.DataFrame, torch.Tensor | None, list[torch.Tensor] | None]:
+def _build_weighted_adj_matrices(
+    config: TrainConfig,
+    *,
+    relations: list[tuple[str, str]] | None = None,
+) -> tuple[pd.DataFrame, torch.Tensor | None, list[torch.Tensor] | None]:
+    """Build weighted adjacency matrix(es) from config and river relations.
+
+    When ``config.several_gnn_layers`` is True, builds one matrix per strategy in
+    ``ALL_WEIGHTED_ADJ_FNS`` and returns them as a list of tensors. Otherwise
+    returns a single hydrological (or configured) matrix.
+
+    Args:
+        config: Training configuration with paths and adjacency options.
+        relations: Optional upstream-downstream pairs; defaults to config relations.
+
+    Returns:
+        Tuple ``(weighted_adj_df, adj_tensor, adj_tensors)`` where ``weighted_adj_df``
+        is a square ``pd.DataFrame`` (station IDs as index/columns), ``adj_tensor`` is
+        set for single-branch mode, and ``adj_tensors`` is set for multi-branch mode.
+    """
     static_info = config.static_info_path
+    graph_relations = relations or config.resolve_relations()
     if config.several_gnn_layers:
         weighted_adjs = [
             adj_fn(
                 station_ids=DEFAULT_STATION_IDS,
-                relations=DEFAULT_RELATIONS,
+                relations=graph_relations,
                 static_info=static_info,
             )
             for adj_fn in ALL_WEIGHTED_ADJ_FNS
         ]
         weighted_adj = create_weighted_adj_matrix_hydrological(
             station_ids=DEFAULT_STATION_IDS,
-            relations=DEFAULT_RELATIONS,
+            relations=graph_relations,
             static_info=static_info,
         )
         adj_tensors = [
@@ -1165,11 +1724,100 @@ def _build_weighted_adj_matrices(config: TrainConfig) -> tuple[pd.DataFrame, tor
 
     weighted_adj = config.resolve_weighted_adj_fn()(
         station_ids=DEFAULT_STATION_IDS,
-        relations=DEFAULT_RELATIONS,
+        relations=graph_relations,
         static_info=static_info,
     )
     adj_tensor = torch.tensor(weighted_adj.to_numpy(dtype=np.float32))
     return weighted_adj, adj_tensor, None
+
+
+def build_weighted_adj_for_relations(
+    config: TrainConfig,
+    relations: list[tuple[str, str]],
+) -> tuple[pd.DataFrame, torch.Tensor | None, list[torch.Tensor] | None]:
+    """Build adjacency matrix(es) for a specific set of river relations.
+
+    Args:
+        config: Training configuration with paths and adjacency options.
+        relations: Upstream-downstream station pairs defining the graph.
+
+    Returns:
+        Same tuple as ``_build_weighted_adj_matrices``.
+    """
+    return _build_weighted_adj_matrices(config, relations=relations)
+
+
+def set_model_adjacency(
+    model: nn.Module,
+    adj: torch.Tensor,
+    config: TrainConfig,
+) -> None:
+    """Replace the adjacency buffer on a single-adjacency model.
+
+    Args:
+        model: ``TemporalGNN`` or ``TemporalGNNLSTMOnly`` with an ``adj`` buffer.
+        adj: Raw adjacency tensor ``(num_nodes, num_nodes)``; normalised in place.
+        config: Supplies the normalisation function and graph options.
+
+    Raises:
+        NotImplementedError: For multi-adjacency model classes.
+        TypeError: If the model has no supported adjacency attribute.
+    """
+    normalized = config.normalize_adj_fn()(adj)
+    device = next(model.parameters()).device
+    normalized = normalized.to(device=device, dtype=next(model.parameters()).dtype)
+
+    if hasattr(model, "adj"):
+        if "adj" in model._buffers:
+            del model._buffers["adj"]
+        model.register_buffer("adj", normalized)
+        return
+
+    if hasattr(model, "num_branches"):
+        raise NotImplementedError(
+            "set_model_adjacency does not support multi-adjacency models yet"
+        )
+    raise TypeError(f"Unsupported model type for adjacency swap: {type(model).__name__}")
+
+
+def prepare_temporal_gnn_eval_data(
+    config: TrainConfig,
+    relations: list[tuple[str, str]],
+    split_idx: int,
+) -> tuple[list[StationSeries], list[str], DataLoader, pd.DataFrame]:
+    """Prepare test data for evaluation with a custom graph topology.
+
+    Args:
+        config: Training configuration (pickle path, window size, model type).
+        relations: Upstream-downstream pairs used to build the adjacency matrix.
+        split_idx: Index separating train and test sliding-window samples.
+
+    Returns:
+        Tuple ``(series, station_ids, test_loader, weighted_adj)`` where
+        ``weighted_adj`` is a square ``pd.DataFrame`` indexed by station ID.
+
+    Raises:
+        ValueError: If ``split_idx`` is outside the valid sample range.
+    """
+    weighted_adj, _, _ = build_weighted_adj_for_relations(config, relations)
+    station_ids = list(weighted_adj.index)
+    series = load_station_series(config.pickle_path, station_ids)
+    total_days = series[0].dynamic.shape[0]
+    num_samples = total_days - config.window_days + 1
+    if split_idx < 0 or split_idx >= num_samples:
+        raise ValueError(
+            f"split_idx {split_idx} is out of range for {num_samples} sliding windows"
+        )
+
+    if config.uses_mono_encoder():
+        test_dataset = GraphWindowDatasetLSTMOnly(
+            series, config.window_days, split_idx, num_samples
+        )
+    else:
+        test_dataset = GraphWindowDataset(series, config.window_days, split_idx, num_samples)
+
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    return series, station_ids, test_loader, weighted_adj
 
 
 def prepare_temporal_gnn_data(config: TrainConfig) -> tuple[
@@ -1185,6 +1833,22 @@ def prepare_temporal_gnn_data(config: TrainConfig) -> tuple[
     int,
     int,
 ]:
+    """Load data, build adjacency, and create train/test DataLoaders.
+
+    Reads the pickle at ``config.pickle_path``, aligns stations to the adjacency
+    index, splits sliding windows by ``config.test_fraction``, and returns tensor
+    adjacency(ies) ready for model construction.
+
+    Args:
+        config: Full training configuration.
+
+    Returns:
+        Tuple ``(series, station_ids, split_idx, train_loader, test_loader,
+        weighted_adj, adj_tensor, adj_tensors, dynamic_dim, static_dim, input_dim)``.
+
+    Raises:
+        ValueError: If the time series are too short for the configured window.
+    """
     weighted_adj, adj_tensor, adj_tensors = _build_weighted_adj_matrices(config)
     station_ids = list(weighted_adj.index)
     series = load_station_series(config.pickle_path, station_ids)
@@ -1232,6 +1896,18 @@ def _mean_training_metric_loss(
     *,
     mono: bool,
 ) -> float:
+    """Compute mean training-metric loss over a DataLoader.
+
+    Args:
+        model: Model to evaluate (set to eval mode internally).
+        loader: Train or test DataLoader yielding mono or dual batches.
+        loss_fn: ``TrainingMetricLoss`` instance.
+        device: Device for tensor transfers.
+        mono: If True, batches are ``(features, targets)``; else three-tuple batches.
+
+    Returns:
+        Average loss per batch, or ``nan`` if the loader is empty.
+    """
     model.eval()
     total_loss = 0.0
     batch_count = 0
@@ -1263,6 +1939,18 @@ def _train_one_batch(
     *,
     mono: bool,
 ) -> torch.Tensor:
+    """Move one batch to device and run a forward pass.
+
+    Args:
+        model: Temporal GNN module.
+        batch: Mono tuple ``(features, targets)`` or dual tuple
+            ``(dynamic, static, targets)``.
+        device: Target compute device.
+        mono: Whether the batch follows the mono-encoder layout.
+
+    Returns:
+        Tuple ``(predictions, targets)`` both on ``device``.
+    """
     if mono:
         features_batch, y_batch = batch
         features_batch = features_batch.to(device)
@@ -1276,6 +1964,15 @@ def _train_one_batch(
 
 
 def run_temporal_gnn_training(config: TrainConfig | None = None) -> RunResult:
+    """Train a temporal GNN from scratch and evaluate on the held-out split.
+
+    Args:
+        config: Hyperparameters and file paths; uses ``TrainConfig()`` defaults when
+            ``None``.
+
+    Returns:
+        ``RunResult`` containing the trained model and evaluation artefacts.
+    """
     config = config or TrainConfig()
     set_random_seed(config.seed)
 
@@ -1366,6 +2063,19 @@ def config_from_saved_metadata(
     config: TrainConfig,
     model_path: str | Path,
 ) -> TrainConfig:
+    """Merge hyperparameters from a checkpoint JSON sidecar into a config.
+
+    Reads ``model_path`` with ``.json`` extension if present and overrides fields
+    such as ``weighted_adj``, ``model_type``, ``hidden_dim``, and normalisation.
+
+    Args:
+        config: Base configuration to update.
+        model_path: Path to the ``.pt`` checkpoint (metadata uses ``.json`` suffix).
+
+    Returns:
+        New ``TrainConfig`` with saved metadata applied, or ``config`` unchanged if
+        no metadata file exists.
+    """
     metadata_path = Path(model_path).with_suffix(".json")
     if not metadata_path.exists():
         return config
@@ -1418,6 +2128,15 @@ def load_and_evaluate_temporal_gnn_run(
     config: TrainConfig,
     model_path: str | Path,
 ) -> RunResult:
+    """Load a saved checkpoint and run full test-set evaluation.
+
+    Args:
+        config: Base configuration; updated from checkpoint metadata when present.
+        model_path: Path to the ``.pt`` weights file.
+
+    Returns:
+        ``RunResult`` with predictions, errors, and return-period metrics.
+    """
     config = config_from_saved_metadata(config, model_path)
     (
         series,
@@ -1454,29 +2173,51 @@ def load_and_evaluate_temporal_gnn_run(
     )
 
 
-def main() -> None:
-    config = TrainConfig()
-    result = run_temporal_gnn_training(config)
+def plot_temporal_gnn_visuals(
+    result: RunResult,
+    config: TrainConfig,
+    *,
+    visuals_dir: str | Path | None = None,
+    filename_prefix: str = "gnn_lstm",
+    gnn_model_label: str = "GNN-LSTM",
+    year_range: tuple[int | None, int | None] = (2016, 2022),
+    show_model_summary: bool = True,
+) -> None:
+    """Generate evaluation plots and optional model summary for a completed run.
+
+    Writes PNG/HTML files under ``visuals_dir`` when set, including test-year
+    hydrographs, return-period NRMSE plots, and NSE/KGE map visualisations.
+
+    Args:
+        result: Training or evaluation result with predictions and errors.
+        config: Run configuration (paths, window size, peak handling).
+        visuals_dir: Output directory; falls back to ``config.visuals_dir``.
+        filename_prefix: Prefix for all output filenames.
+        gnn_model_label: Legend label used in return-period plots.
+        year_range: Optional ``(start_year, end_year)`` filter for test-year plots.
+        show_model_summary: If True, print architecture summary to stdout.
+    """
     model = result.model
     series = result.series
     station_ids = result.station_ids
-    split_idx = result.split_idx
     test_start_idx = result.test_start_idx
-    test_loader = result.test_loader
     weighted_adj = result.weighted_adj
     prediction_frames = result.prediction_frames
     window_days = config.window_days
 
-    if isinstance(model, TemporalGNN):
-        print_temporal_gnn_summary(model, window_days=window_days)
-    elif isinstance(model, TemporalGNNLSTMOnly):
-        print_temporal_gnn_lstm_only_summary(model, window_days=window_days)
-    else:
-        print(f"Trained model: {model.__class__.__name__}")
+    if show_model_summary:
+        if isinstance(model, TemporalGNN):
+            print_temporal_gnn_summary(model, window_days=window_days)
+        elif isinstance(model, TemporalGNNLSTMOnly):
+            print_temporal_gnn_lstm_only_summary(model, window_days=window_days)
+        else:
+            print(f"Trained model: {model.__class__.__name__}")
 
-    visuals_dir = Path(config.visuals_dir) if config.visuals_dir is not None else None
-    if visuals_dir is not None:
-        visuals_dir.mkdir(parents=True, exist_ok=True)
+    if visuals_dir is None:
+        visuals_dir = config.visuals_dir
+    visuals_path = Path(visuals_dir) if visuals_dir is not None else None
+    if visuals_path is not None:
+        visuals_path.mkdir(parents=True, exist_ok=True)
 
     test_years = sorted(set(pd.to_datetime(series[0].dates[test_start_idx:]).year))
     test_start_date = pd.Timestamp(series[0].dates[test_start_idx])
@@ -1487,9 +2228,9 @@ def main() -> None:
         test_years=test_years,
         station_ids=station_ids,
         station_names=station_names,
-        output_dir=visuals_dir / "gnn_lstm_test_years" if visuals_dir is not None else None,
-        filename_prefix="gnn_lstm",
-        year_range=(2016, 2022),
+        output_dir=visuals_path / f"{filename_prefix}_test_years" if visuals_path is not None else None,
+        filename_prefix=filename_prefix,
+        year_range=year_range,
         test_start_date=test_start_date,
         test_end_date=test_end_date,
     )
@@ -1500,12 +2241,12 @@ def main() -> None:
     plot_return_period_nrmse_boxplots(
         prediction_frames,
         station_ids=station_ids,
-        gnn_model_label="GNN-LSTM",
+        gnn_model_label=gnn_model_label,
         test_start_date=peak_test_start,
         examine_train_test=config.examine_train_test_peaks,
         output_path=(
-            visuals_dir / "gnn_lstm_return_period_nrmse_boxplots.png"
-            if visuals_dir is not None
+            visuals_path / f"{filename_prefix}_return_period_nrmse_boxplots.png"
+            if visuals_path is not None
             else None
         ),
         show_plot=False,
@@ -1513,13 +2254,13 @@ def main() -> None:
     plot_return_period_nrmse_lineplots(
         prediction_frames,
         station_ids=station_ids,
-        gnn_model_label="GNN-LSTM",
+        gnn_model_label=gnn_model_label,
         test_start_date=peak_test_start,
         examine_train_test=config.examine_train_test_peaks,
         station_names=station_names,
         output_path=(
-            visuals_dir / "gnn_lstm_return_period_nrmse_lineplots.png"
-            if visuals_dir is not None
+            visuals_path / f"{filename_prefix}_return_period_nrmse_lineplots.png"
+            if visuals_path is not None
             else None
         ),
         show_plot=False,
@@ -1528,8 +2269,8 @@ def main() -> None:
     error_metric = "NSE"
     error_by_station = result.errors_by_metric[error_metric]
     output_html = (
-        visuals_dir / f"gnn_lstm_{error_metric.lower()}_NSE_map.html"
-        if visuals_dir is not None
+        visuals_path / f"{filename_prefix}_{error_metric.lower()}_NSE_map.html"
+        if visuals_path is not None
         else None
     )
     plot_graph_error_map(
@@ -1540,14 +2281,18 @@ def main() -> None:
         output_html=output_html,
         show_plot=False,
         show_edge_km=False,
-        output_png=visuals_dir / f"gnn_lstm_{error_metric.lower()}_NSE_map.png" if visuals_dir is not None else None,
+        output_png=(
+            visuals_path / f"{filename_prefix}_{error_metric.lower()}_NSE_map.png"
+            if visuals_path is not None
+            else None
+        ),
     )
 
     error_metric = "KGE"
     error_by_station = result.errors_by_metric[error_metric]
     output_html = (
-        visuals_dir / f"gnn_lstm_{error_metric.lower()}_KGE_map.html"
-        if visuals_dir is not None
+        visuals_path / f"{filename_prefix}_{error_metric.lower()}_KGE_map.html"
+        if visuals_path is not None
         else None
     )
     plot_graph_error_map(
@@ -1558,23 +2303,29 @@ def main() -> None:
         output_html=output_html,
         show_plot=False,
         show_edge_km=False,
-        output_png=visuals_dir / f"gnn_lstm_{error_metric.lower()}_KGE_map.png" if visuals_dir is not None else None,
+        output_png=(
+            visuals_path / f"{filename_prefix}_{error_metric.lower()}_KGE_map.png"
+            if visuals_path is not None
+            else None
+        ),
     )
 
-    if visuals_dir is not None:
+    if visuals_path is not None:
         plot_KGE_separated_map(
             weighted_adj,
             config.static_info_path,
             station_frames=prediction_frames,
-            output_html=visuals_dir / "gnn_lstm_kge_separated_map.html",
-            output_png=visuals_dir / "gnn_lstm_kge_separated_map.png",
+            output_html=visuals_path / f"{filename_prefix}_kge_separated_map.html",
+            output_png=visuals_path / f"{filename_prefix}_kge_separated_map.png",
             show_edge_km=False,
             show_plot=False,
         )
 
     nse_by_station = result.errors_by_metric["NSE"]
     conchi_output_html = (
-        visuals_dir / "gnn_lstm_nse_conchi_lstm_comparison.html" if visuals_dir is not None else None
+        visuals_path / f"{filename_prefix}_nse_conchi_lstm_comparison.html"
+        if visuals_path is not None
+        else None
     )
     comparison_NSE_conchi(
         weighted_adj,
@@ -1583,13 +2334,28 @@ def main() -> None:
         conchi_model="LSTM",
         conchi_scenario="TS2",
         output_html=conchi_output_html,
-        output_png=visuals_dir / "gnn_lstm_nse_conchi_lstm_comparison.png" if visuals_dir is not None else None,
+        output_png=(
+            visuals_path / f"{filename_prefix}_nse_conchi_lstm_comparison.png"
+            if visuals_path is not None
+            else None
+        ),
         show_plot=False,
         show_edge_km=False,
     )
 
 
+
 def build_graph_sequences(series: list[StationSeries], end_idx: int, window_days: int) -> np.ndarray:
+    """Extract dynamic feature windows for all nodes ending at ``end_idx``.
+
+    Args:
+        series: One ``StationSeries`` per graph node.
+        end_idx: Inclusive end index into the daily time axis.
+        window_days: Look-back length in days.
+
+    Returns:
+        Array ``(num_nodes, window_days, dynamic_dim)``.
+    """
     num_nodes = len(series)
     dynamic_dim = series[0].dynamic.shape[1]
     dynamic = np.zeros((num_nodes, window_days, dynamic_dim), dtype=np.float32)
@@ -1604,6 +2370,16 @@ def build_graph_sequences_with_static(
     end_idx: int,
     window_days: int,
 ) -> np.ndarray:
+    """Extract fused dynamic+static windows for mono-encoder inference.
+
+    Args:
+        series: One ``StationSeries`` per graph node.
+        end_idx: Inclusive end index into the daily time axis.
+        window_days: Look-back length in days.
+
+    Returns:
+        Array ``(num_nodes, window_days, dynamic_dim + static_dim)``.
+    """
     num_nodes = len(series)
     dynamic_dim = series[0].dynamic.shape[1]
     static_dim = series[0].static.shape[0]
@@ -1622,6 +2398,19 @@ def _forward_model(
     features_batch: torch.Tensor,
     static_batch: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Dispatch forward pass for mono or dual encoder models.
+
+    Args:
+        model: ``TemporalGNN*`` module instance.
+        features_batch: Dynamic or fused features ``(batch, nodes, window, feat)``.
+        static_batch: Static features for dual models; required when not mono.
+
+    Returns:
+        Raw model predictions before streamflow clamping.
+
+    Raises:
+        ValueError: If ``static_batch`` is missing for a dual-encoder model.
+    """
     if _is_mono_model(model):
         return model(features_batch)
     if static_batch is None:
@@ -1634,6 +2423,17 @@ def build_prediction_frames(
     series: list[StationSeries],
     window_days: int,
 ) -> dict[str, pd.DataFrame]:
+    """Build per-station observed vs predicted time series over all valid windows.
+
+    Args:
+        model: Trained temporal GNN in eval mode.
+        series: Loaded station series aligned on a common date index.
+        window_days: Input look-back length used during inference.
+
+    Returns:
+        Dict mapping ``station_id`` to a ``DataFrame`` with columns ``date``,
+        ``observed``, and ``predicted`` (one row per forecast day).
+    """
     if not series:
         return {}
 
@@ -1672,6 +2472,20 @@ def compute_node_errors(
     station_ids: list[str],
     error_metric: str = "NSE",
 ) -> dict[str, float]:
+    """Compute a hydrological error metric independently for each station.
+
+    Aggregates all batches from ``loader``, clamps predictions at zero, and
+    delegates metric computation to ``compute_station_error``.
+
+    Args:
+        model: Trained temporal GNN.
+        loader: Test (or train) DataLoader in mono or dual batch layout.
+        station_ids: Station IDs in graph node order matching batch dimension 1.
+        error_metric: Metric name accepted by ``compute_station_error`` (e.g. ``"NSE"``).
+
+    Returns:
+        Mapping ``station_id -> metric_value``; ``nan`` when no samples exist.
+    """
     device = next(model.parameters()).device
     observed_by_station: dict[str, list[float]] = {station_id: [] for station_id in station_ids}
     predicted_by_station: dict[str, list[float]] = {station_id: [] for station_id in station_ids}
@@ -1711,6 +2525,21 @@ def compute_node_errors(
         for station_id in station_ids
     }
 
+
+def main() -> None:
+    """Run default training, save baseline checkpoint, and generate evaluation plots."""
+    config = TrainConfig(run_name=DEFAULT_BASELINE_MODEL_NAME)
+    result = run_temporal_gnn_training(config)
+    model_dir = config.model_dir or DEFAULT_MODEL_DIR
+    model_path = Path(model_dir) / f"{DEFAULT_BASELINE_MODEL_NAME}.pt"
+    saved_model_path, saved_metadata_path = save_temporal_gnn_run(
+        result.model,
+        config,
+        model_path,
+    )
+    print(f"Saved model to {saved_model_path}")
+    print(f"Saved metadata to {saved_metadata_path}")
+    plot_temporal_gnn_visuals(result, config)
 
 if __name__ == "__main__":
     main()

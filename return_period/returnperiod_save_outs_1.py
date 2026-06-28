@@ -1,24 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Wed Jun 12 12:17:00 2024
+"""Fit Gumbel log-return-period curves and export plots and CSV summaries.
 
-@author: 77386569X
+Reads daily multi-station streamflow from a semicolon-separated text file,
+fits ``y = a * ln(T) + b`` to ranked annual maxima per station, and writes
+per-station figures plus aggregated CSV outputs under ``output_data/``.
 """
-"""Function: Calculate the return period of any hydrographs.
-            Method: The return Period of Flood Flows, E. J. Gumbel (1941).The Annals of Mathematical Statistics, Vol. 12, No. 2,pp. 163-190
-    Inputs: streamflow: Import a .txt where rows have to be in datetime type and columns have to be the daily flow of each gauging station.
-                    (Default: 'aforo_subcuencas_ebro.txt')
-            stations: Stations library (aforo_subcuencas_ebro) contains all stations included in SAIH web for north face Ebro.
-                      You can add all number stations you need in a string list (e.g. ['001','002','003', '018'])
-                      If you have imported another .txt, you have to include elements of new columns.
-                      Excel document 'Tabla.txt' has the information about the name station asociated to the number station.
-            returnperiod: You can add a integer list with the return period you want to calculate (e.g. [0.5, 1, 2, 5, 10] [years])
-    Outputs: popt: first element is the 'a' element in the logarithm function
-                   second element is the 'b' element in the logarithm function
-                   Being logarithm function: y=a*ln(x)+b  where x is the return period.
-             y_p: Dictionary with each streamflow for each return period and each station.
-             figure 1: plot log curve. This curve is the trend of the maximum annual data observed. (x axis: return period, y axis: streamflow)
-             figure 2: plot daily hydrograph with desired return periods """
 
 from __future__ import annotations
 
@@ -38,10 +24,25 @@ RETURN_PERIODS = [0.5, 1, 2, 5, 10]
 
 
 def func(x, a, b):
+    """Gumbel-style log return-period relationship ``y = a * ln(x) + b``."""
     return a * np.log(x) + b
 
 
 def load_streamflow(path: Path) -> pd.DataFrame:
+    """Load multi-station daily streamflow from a return-period export file.
+
+    Input file structure (semicolon-separated):
+        Row 0: ``Time;<station_ids...>``
+        Row 1: ``station catchment;<catchment names...>``
+        Row 2: ``station name;<station names...>``
+        Remaining rows: ``YYYY-MM-DD;<streamflow values...>``
+
+    Args:
+        path: Path to the streamflow text file.
+
+    Returns:
+        DataFrame indexed by datetime with one float column per station id.
+    """
     streamflow = pd.read_csv(path, sep=";")
     streamflow.drop([0, 1], axis=0, inplace=True)
     streamflow.set_index("Time", drop=True, inplace=True)
@@ -54,6 +55,21 @@ def fit_station_return_periods(
     streamflow: pd.DataFrame,
     return_periods: list[float],
 ) -> tuple[pd.DataFrame, np.ndarray, float, dict[float, float]]:
+    """Rank annual maxima, fit a log return-period curve, and interpolate flows.
+
+    Args:
+        station_id: Column name in ``streamflow`` for the target station.
+        streamflow: Daily streamflow DataFrame indexed by date.
+        return_periods: Return periods in years for which to predict flow.
+
+    Returns:
+        Tuple of:
+            - Daily streamflow column as a one-column DataFrame.
+            - Ranked annual-maxima table with probabilities and fitted values.
+            - Optimal parameters ``(a, b)`` for ``func``.
+            - R² score of the log fit.
+            - Dict mapping each requested return period to fitted streamflow (m³/s).
+    """
     y = pd.DataFrame(streamflow[station_id]).astype(float)
     y_max_anual = y.resample("Y").max()
     y_sorted = y_max_anual.sort_values(by=y_max_anual.columns[0], ascending=False)
@@ -78,6 +94,17 @@ def save_return_period_fit_plot(
     popt: np.ndarray,
     output_dir: Path,
 ) -> Path:
+    """Save a return-period fit scatter plot with the fitted log curve.
+
+    Args:
+        station_id: Station identifier used in the plot title and filename.
+        y_sorted: Ranked annual maxima with ``return period`` and observed flow.
+        popt: Fitted ``(a, b)`` parameters for ``func``.
+        output_dir: Directory where the PNG figure is written.
+
+    Returns:
+        Path to the saved PNG file.
+    """
     figure_path = output_dir / f"station_{station_id}_return_period_fit.png"
     plt.figure()
     plt.plot(y_sorted["return period"], y_sorted[station_id], "bo", label="data")
@@ -105,6 +132,19 @@ def save_hydrograph_plot(
     return_periods: list[float],
     output_dir: Path,
 ) -> Path:
+    """Plot observed daily hydrograph with horizontal return-period flow lines.
+
+    Args:
+        station_id: Station identifier for titles and filenames.
+        streamflow: Full daily streamflow DataFrame indexed by date.
+        daily_streamflow: One-column daily series for the target station.
+        streamflows_by_period: Fitted flow values keyed by return period (years).
+        return_periods: Return periods to annotate on the plot.
+        output_dir: Directory where the PNG figure is written.
+
+    Returns:
+        Path to the saved PNG file.
+    """
     figure_path = output_dir / f"station_{station_id}_hydrograph_return_periods.png"
     plt.figure()
     plt.plot(streamflow.index, daily_streamflow, "royalblue", label="observed data")
@@ -141,6 +181,21 @@ def save_station_csvs(
     streamflows_by_period: dict[float, float],
     output_dir: Path,
 ) -> None:
+    """Write per-station CSV files for ranked maxima, fit params, and flows.
+
+    Output files (under ``output_dir``):
+        - ``station_<id>_annual_maxima_ranked.csv``
+        - ``station_<id>_fitted_parameters.csv``
+        - ``station_<id>_return_period_streamflows.csv``
+
+    Args:
+        station_id: Target station identifier.
+        y_sorted: Ranked annual maxima with probabilities and predictions.
+        popt: Fitted log-curve parameters ``(a, b)``.
+        r2: Coefficient of determination for the fit.
+        streamflows_by_period: Interpolated flows by return period (years).
+        output_dir: Destination folder for CSV exports.
+    """
     annual_maxima_path = output_dir / f"station_{station_id}_annual_maxima_ranked.csv"
     y_sorted.to_csv(annual_maxima_path, index=False)
 
@@ -182,6 +237,19 @@ def save_summary_csvs(
     return_periods: list[float],
     output_dir: Path,
 ) -> None:
+    """Write combined CSV summaries across all processed stations.
+
+    Output files (under ``output_dir``):
+        - ``all_stations_fitted_parameters.csv``
+        - ``all_stations_return_period_streamflows.csv`` (long format)
+        - ``all_stations_return_period_streamflows_wide.csv`` (wide format)
+
+    Args:
+        fitted_rows: One dict per station with log-fit metadata.
+        streamflow_rows: Long-format rows with station, period, and flow.
+        return_periods: Return periods used as wide-format column suffixes.
+        output_dir: Destination folder for summary CSV files.
+    """
     fitted_df = pd.DataFrame(fitted_rows)
     fitted_df.to_csv(output_dir / "all_stations_fitted_parameters.csv", index=False)
 
@@ -210,6 +278,7 @@ def save_summary_csvs(
 
 
 def main() -> None:
+    """Run return-period analysis for all configured stations and save outputs."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     streamflow = load_streamflow(STREAMFLOW_FILE)
 
